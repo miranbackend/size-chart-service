@@ -1,0 +1,70 @@
+# Merge these components into your existing DigitalOcean App Platform spec.
+# Keep your existing service(s) unchanged.
+
+name: size-chart-system
+
+workers:
+  - name: size-chart-worker
+    source_dir: app
+    github:
+      repo: YOUR_ORG/YOUR_REPO
+      branch: main
+      deploy_on_push: true
+    instance_count: 2
+    instance_size_slug: professional-xs
+    run_command: python worker.py
+    envs:
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: ${DATABASE_URL}
+      - key: BATCH_SIZE
+        scope: RUN_TIME
+        value: "10"
+      - key: DB_POOL_SIZE
+        scope: RUN_TIME
+        value: "5"
+      - key: POLL_SECONDS
+        scope: RUN_TIME
+        value: "10"
+
+jobs:
+  - name: size-chart-enqueue
+    kind: SCHEDULED
+    schedule:
+      cron: "*/30 * * * *"
+      time_zone: "Asia/Kolkata"
+    source_dir: app
+    github:
+      repo: YOUR_ORG/YOUR_REPO
+      branch: main
+      deploy_on_push: true
+    run_command: python enqueue.py
+    envs:
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: ${DATABASE_URL}
+      - key: ENQUEUE_LIMIT
+        scope: RUN_TIME
+        value: "5000"
+
+  - name: size-chart-recover
+    kind: SCHEDULED
+    schedule:
+      cron: "*/30 * * * *"
+      time_zone: "Asia/Kolkata"
+    source_dir: app
+    github:
+      repo: YOUR_ORG/YOUR_REPO
+      branch: main
+      deploy_on_push: true
+    run_command: python recover.py
+    envs:
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: ${DATABASE_URL}
+      - key: STALE_TIMEOUT_MINUTES
+        scope: RUN_TIME
+        value: "30"
