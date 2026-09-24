@@ -1,4 +1,4 @@
-import os
+	import os
 import re
 import json
 import time
@@ -567,6 +567,10 @@ def process_once():
     return processed
 
 def main():
+    if os.getenv("WORKER_ENABLED", "true").lower() != "true":
+    log.info("Worker disabled by WORKER_ENABLED")
+    return
+
     log.info("Starting size-chart worker %s", WORKER_ID)
 
     while True:
