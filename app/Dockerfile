@@ -5,6 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY worker.py .
+COPY worker.py extraction.py url_resolution.py ./
 
 CMD ["python", "worker.py"]

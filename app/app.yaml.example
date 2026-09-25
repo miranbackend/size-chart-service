@@ -27,6 +27,27 @@ workers:
       - key: POLL_SECONDS
         scope: RUN_TIME
         value: "10"
+      # The worker idles (and stays alive) unless this is exactly "true".
+      - key: WORKER_ENABLED
+        scope: RUN_TIME
+        value: "false"
+      - key: HTTP_TIMEOUT_SECONDS
+        scope: RUN_TIME
+        value: "25"
+      - key: NAV_TIMEOUT_MS
+        scope: RUN_TIME
+        value: "45000"
+      - key: BROWSER_WAIT_MS
+        scope: RUN_TIME
+        value: "1500"
+      - key: MAX_CHART_ROWS
+        scope: RUN_TIME
+        value: "100"
+      # Off by default: fetching google.com/search mostly returns
+      # "unusual traffic" pages; nothing tries to get past them.
+      - key: GOOGLE_HTTP_RESOLUTION
+        scope: RUN_TIME
+        value: "false"
 
 jobs:
   - name: size-chart-enqueue

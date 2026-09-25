@@ -39,21 +39,45 @@ Set `DATABASE_URL` to your DigitalOcean PostgreSQL connection string. Prefer a D
 
 From `app/`:
 
-`pip install -r requirements.txt`
+```
+pip install -r requirements.txt -r requirements-dev.txt
+playwright install chromium
+```
 
-Install browser:
+Unit + fixture tests (no database, no network):
 
-`playwright install chromium`
+```
+python -m pytest
+```
 
-Then:
+Database tests need a disposable PostgreSQL whose database name contains
+`test` (the tests DROP and recreate tables from `sql/001_size_chart_schema.sql`):
 
-`DATABASE_URL='...' python enqueue.py`
+```
+TEST_DATABASE_URL=postgresql://postgres@localhost:5432/sizechart_test python -m pytest
+```
 
-and:
+Try the extractor without touching the database:
 
-`DATABASE_URL='...' python worker.py`
+```
+python worker.py extract-url "https://www.myntra.com/shirts/cahoot/cahoot-men-comfort-opaque-checked-casual-shirt/31472271/buy" --no-browser
+python worker.py extract-file saved_page.html --url "<the page's product URL>"
+```
 
-Start with one worker and a tiny enqueue limit.
+Process one real product read-only (resolves + extracts, writes nothing):
+
+```
+DATABASE_URL='postgresql://...?...sslmode=require' python worker.py dry-run --product-id 123
+```
+
+Run the queue worker (only when you intend to):
+
+```
+DATABASE_URL='...' WORKER_ENABLED=true BATCH_SIZE=1 python worker.py
+```
+
+`WORKER_ENABLED` defaults to `false`; a disabled worker stays alive and idle
+(App Platform restarts workers that exit) and opens no database connection.
 
 ## 4. App Platform
 
@@ -69,18 +93,44 @@ Recommended initial production setup:
 
 Scale worker instances after measuring retailer response times and database load.
 
-## 5. What the extractor currently does
+## 5. What the worker does
 
-1. Detects Amazon, Myntra, AJIO, Flipkart, Nykaa or other domains.
-2. Attempts a normal HTTP request.
-3. Searches real HTML tables for size/measurement columns.
-4. Uses Playwright when JavaScript rendering is required.
-5. Attempts conservative clicks on size-guide/size-chart controls.
-6. Detects likely size-chart images.
-7. Stores only extracted measurements as `found`.
-8. Does NOT fabricate measurements.
-9. Marks blocked pages separately.
-10. Retries failures with backoff.
+Code layout:
+
+- `url_resolution.py`: product URL -> retailer product page
+- `extraction.py`: pure parsing/validation, no network or DB
+- `worker.py`: queue, fetching, persistence, CLI
+
+Per job:
+
+1. **Resolve the retailer URL.** Direct retailer URLs are used as-is. For Google Shopping URLs the worker uses a destination embedded in the URL (`?url=`, `?q=`, `?adurl=`) or a retailer link already stored in `gsa_product.raw`. It does not fetch Google unless `GOOGLE_HTTP_RESOLUTION=true`, and a Google challenge page is recorded as `blocked`. A Google URL with no retailer link becomes `url_resolution_status='unresolved'`, and the product is marked `not_found` with `size_chart_error='retailer_url_unresolved: ...'`. A successful resolution is cached in `resolved_product_url` and reused.
+2. **Fetch over HTTP first.** The response is size-capped and uses a realistic User-Agent, Accept and Accept-Language.
+3. **Extract**, in priority order:
+   1. The retailer adapter. Myntra reads `window.__myx.pdpData.sizes[].measurements`, matched by the exact `window.__myx =` assignment, never `__myx_deviceType__`. `pdpData.id` must equal the style id in the URL, and only sizes whose `styleId` matches are used. GARMENT measurements are preferred over BODY ones, and the two are never mixed.
+   2. Generic embedded JSON: `ld+json`, `__NEXT_DATA__`, `window.__INITIAL_STATE__ = ...`, and so on.
+   3. HTML `<table>` charts, including transposed ones.
+   4. A headless browser, only when the page was reachable but had no chart. It clicks a size-guide control once.
+   5. Size-chart image detection. The product is marked `pending_ocr` and the image URLs go in `size_chart_error`. Nothing is stored as measurements.
+4. **Validate.** A chart needs at least 2 size rows. Each row needs at least 1 recognised measurement field (chest, waist, length, ...) with a numeric value. Availability, stock, price and size-conversion columns are never measurements. A page without an id match whose title clearly differs from `gsa_product.title` is rejected as `product_mismatch`.
+5. **Persist in one transaction.** This covers the `gsa_product_measurement` upsert (`ON CONFLICT (product_id, size_label)`, removing sizes no longer in the chart), `finish_size_chart_job(...)`, the `gsa_product.size_chart_status` update, and the URL-resolution columns.
+
+Status mapping:
+
+| outcome | job (`finish_size_chart_job`) | `gsa_product.size_chart_status` | retry |
+|---|---|---|---|
+| chart found | found | found | - |
+| no product-specific chart / product mismatch / unresolved Google URL | not_found | not_found | 7 days |
+| size-chart image only | not_found | pending_ocr | 7 days |
+| CAPTCHA / anti-bot / 403 / 429 | blocked | blocked | 6h, doubling, max 72h |
+| network / unexpected error | failed | failed | 30m, doubling, max 24h |
+
+After `MAX_ATTEMPTS` (default 5), failed and blocked jobs are retried weekly.
+`pending_ocr` is not a valid `size_chart_jobs.status` in the schema's CHECK
+constraint, so it only appears on `gsa_product`.
+
+The worker claims with `claim_size_chart_jobs(%s::text, %s::integer)`. Without
+the casts, psycopg sends a small Python int as `smallint` and PostgreSQL picks
+the `(text, smallint)` overload.
 
 ## Important production limitation
 
@@ -88,7 +138,7 @@ Retailer page structures, access rules, login requirements, bot protection and s
 
 The current package intentionally does not bypass CAPTCHAs, bot protection, login walls, or other access controls.
 
-Image-only charts are identified but are not marked as verified measurements until an OCR/vision adapter is added.
+Image-only charts are identified (`pending_ocr`) but are not stored as measurements until an OCR/vision adapter is added. Headless Chromium is refused by some retailers (e.g. Myntra returns `ERR_HTTP2_PROTOCOL_ERROR`); the worker records that and does not try to get around it. Myntra data comes from plain HTTP.
 
 ## Scaling
 
