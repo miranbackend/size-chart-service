@@ -44,3 +44,23 @@ def test_database_url_rejects_asyncpg(monkeypatch):
         database_url()
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@h:5432/db?sslmode=require")
     assert database_url().startswith("postgresql://")
+
+
+@pytest.mark.parametrize("mode,enabled,expected", [
+    (None, None, False),     # nothing set -> stopped
+    ("0", None, False),
+    ("1", None, True),
+    ("0", "true", False),    # WORKER_MODE wins over WORKER_ENABLED
+    (None, "true", True),    # old switch still works
+    (None, "false", False),
+    ("2", None, False),      # anything else -> stopped, never running
+    ("yes", None, False),
+])
+def test_worker_mode(monkeypatch, mode, enabled, expected):
+    from worker import _env_worker_enabled
+    for name, value in (("WORKER_MODE", mode), ("WORKER_ENABLED", enabled)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert _env_worker_enabled() is expected

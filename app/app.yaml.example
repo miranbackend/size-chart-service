@@ -27,10 +27,10 @@ workers:
       - key: POLL_SECONDS
         scope: RUN_TIME
         value: "10"
-      # The worker idles (and stays alive) unless this is exactly "true".
-      - key: WORKER_ENABLED
+      # 0 = stopped (stays alive, does nothing), 1 = process size charts.
+      - key: WORKER_MODE
         scope: RUN_TIME
-        value: "false"
+        value: "0"
       - key: HTTP_TIMEOUT_SECONDS
         scope: RUN_TIME
         value: "25"

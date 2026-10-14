@@ -73,11 +73,13 @@ DATABASE_URL='postgresql://...?...sslmode=require' python worker.py dry-run --pr
 Run the queue worker (only when you intend to):
 
 ```
-DATABASE_URL='...' WORKER_ENABLED=true BATCH_SIZE=1 python worker.py
+DATABASE_URL='...' WORKER_MODE=1 BATCH_SIZE=1 python worker.py
 ```
 
-`WORKER_ENABLED` defaults to `false`; a disabled worker stays alive and idle
-(App Platform restarts workers that exit) and opens no database connection.
+`WORKER_MODE=1` starts processing size charts; `WORKER_MODE=0` (the default)
+stops it. A stopped worker stays alive and idle (App Platform restarts workers
+that exit) and opens no database connection. Any other value counts as `0`.
+If `WORKER_MODE` is unset, the older `WORKER_ENABLED=true` still works.
 
 ## 4. App Platform
 

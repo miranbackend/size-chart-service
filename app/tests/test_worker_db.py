@@ -65,7 +65,7 @@ def _schema_sql() -> str:
 def db():
     if "test" not in psycopg.conninfo.conninfo_to_dict(TEST_DB).get("dbname", ""):
         pytest.fail("TEST_DATABASE_URL database name must contain 'test'")
-    with psycopg.connect(TEST_DB, autocommit=True) as conn:
+    with psycopg.connect(TEST_DB, autocommit=True, connect_timeout=10) as conn:
         conn.execute(_schema_sql())
         conn.execute((ROOT / "sql" / "001_size_chart_schema.sql").read_text())
         # Production also has a smallint overload; make sure the worker never
@@ -83,7 +83,7 @@ def db():
 
 @pytest.fixture
 def conn(db):
-    with psycopg.connect(TEST_DB, autocommit=True, row_factory=dict_row) as c:
+    with psycopg.connect(TEST_DB, autocommit=True, row_factory=dict_row, connect_timeout=10) as c:
         c.execute("TRUNCATE gsa_product_measurement, size_chart_jobs, gsa_product CASCADE")
         yield c
 

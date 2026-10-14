@@ -9,7 +9,7 @@ Size-chart worker.
            + gsa_product status, in one transaction
 
 Usage:
-    python worker.py                                  # queue loop (needs WORKER_ENABLED=true)
+    python worker.py                                  # queue loop: WORKER_MODE=1 start, 0 stop
     python worker.py extract-url URL [--title T]      # fetch + extract one URL, no DB
     python worker.py extract-file PATH --url URL      # extract a saved HTML file, no DB
     python worker.py dry-run --product-id ID          # read one product from DB, no writes
@@ -65,11 +65,25 @@ def _env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, "true" if default else "false").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_worker_enabled() -> bool:
+    """
+    WORKER_MODE=1 starts processing size charts, WORKER_MODE=0 stops.
+    Without WORKER_MODE, the older WORKER_ENABLED=true still works.
+    Any other value is treated as stopped, never as running.
+    """
+    mode = os.getenv("WORKER_MODE", "").strip()
+    if not mode:
+        return _env_bool("WORKER_ENABLED", False)
+    if mode not in ("0", "1"):
+        logging.getLogger("size-chart-worker").error("invalid WORKER_MODE=%r (use 0 or 1); staying stopped", mode)
+    return mode == "1"
+
+
 @dataclass
 class Settings:
     worker_id: str = field(default_factory=lambda: os.getenv("WORKER_ID") or socket.gethostname())
     # Off unless explicitly enabled, so a deploy never starts draining the queue by accident.
-    worker_enabled: bool = field(default_factory=lambda: _env_bool("WORKER_ENABLED", False))
+    worker_enabled: bool = field(default_factory=_env_worker_enabled)
     batch_size: int = field(default_factory=lambda: _env_int("BATCH_SIZE", 10))
     poll_seconds: int = field(default_factory=lambda: _env_int("POLL_SECONDS", 10))
     nav_timeout_ms: int = field(default_factory=lambda: _env_int("NAV_TIMEOUT_MS", 45000))
@@ -747,7 +761,7 @@ def run_worker() -> None:
     if not SETTINGS.worker_enabled:
         # App Platform restarts workers that exit, so stay alive while disabled.
         log_event("worker_disabled", worker=SETTINGS.worker_id,
-                  hint="set WORKER_ENABLED=true to process the queue")
+                  hint="set WORKER_MODE=1 to process the queue")
         while not _stop.wait(3600):
             log_event("worker_disabled", worker=SETTINGS.worker_id)
         return
