@@ -42,3 +42,18 @@ def test_worker_mode(monkeypatch, mode, enabled, expected):
         else:
             monkeypatch.setenv(name, value)
     assert _env_worker_enabled() is expected
+
+
+def test_requests_to_one_store_are_paced(monkeypatch):
+    import time
+    import worker
+    monkeypatch.setattr(worker.SETTINGS, "per_host_delay_ms", 200)
+    worker._last_request.clear()
+    start = time.monotonic()
+    worker.wait_for_host("https://store-a.example.com/products/1")
+    worker.wait_for_host("https://store-b.example.com/products/1")   # other store: no wait
+    assert time.monotonic() - start < 0.1
+    worker.wait_for_host("https://store-a.example.com/products/2")   # same store: waits
+    assert time.monotonic() - start >= 0.19
+    worker.wait_for_host("https://store-a.example.com/products/3", crawl_delay=0.4)
+    assert time.monotonic() - start >= 0.58                           # robots Crawl-delay wins

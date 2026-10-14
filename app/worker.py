@@ -27,6 +27,8 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
 from datetime import datetime, timezone
 from typing import Any
 
@@ -97,6 +99,10 @@ class Settings:
     browser_wait_ms: int = field(default_factory=lambda: _env_int("BROWSER_WAIT_MS", 1500))
     max_chart_rows: int = field(default_factory=lambda: _env_int("MAX_CHART_ROWS", 100))
     max_html_bytes: int = field(default_factory=lambda: _env_int("MAX_HTML_BYTES", 8_000_000))
+    # Minimum gap between requests to the same store; a robots.txt Crawl-delay
+    # larger than this is honoured instead.
+    per_host_delay_ms: int = field(default_factory=lambda: _env_int("PER_HOST_DELAY_MS", 1000))
+    respect_robots: bool = field(default_factory=lambda: _env_bool("RESPECT_ROBOTS_TXT", True))
     browser_enabled: bool = field(default_factory=lambda: _env_bool("BROWSER_ENABLED", True))
     browser_restart_every: int = field(default_factory=lambda: _env_int("BROWSER_RESTART_EVERY", 50))
     # Size-chart images in the product description are read with Gemini when a key is set.
@@ -226,6 +232,66 @@ class FetchResult:
 
 
 _TEXT_CONTENT_TYPES = ("html", "json", "javascript", "text/plain", "xml")
+
+
+# ------------------------------------------------------------
+# Politeness: robots.txt + per-store pacing (store pages only;
+# CDN images and the Kiwi / Gemini APIs are not store pages)
+# ------------------------------------------------------------
+
+ROBOTS_TTL_SECONDS = 6 * 3600
+MAX_TRACKED_HOSTS = 20_000
+_robots: dict[str, tuple[float, RobotFileParser | None]] = {}
+_last_request: dict[str, float] = {}
+
+
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}".lower()
+
+
+def robots_for(client: httpx.Client, url: str) -> RobotFileParser | None:
+    """Parsed robots.txt for the store (cached); None means no rules apply."""
+    origin = _origin(url)
+    cached = _robots.get(origin)
+    if cached and time.monotonic() - cached[0] < ROBOTS_TTL_SECONDS:
+        return cached[1]
+    parser: RobotFileParser | None = None
+    fetched = fetch_http(client, origin + "/robots.txt")
+    if not fetched.error and fetched.status == 200 and fetched.html:
+        parser = RobotFileParser()
+        parser.parse(fetched.html.splitlines())
+    # 4xx/5xx/network errors: no usable rules -> allowed (blocks still detected per page)
+    if len(_robots) > MAX_TRACKED_HOSTS:
+        _robots.clear()
+    _robots[origin] = (time.monotonic(), parser)
+    return parser
+
+
+def wait_for_host(url: str, crawl_delay: float | None = None) -> None:
+    """Keep at least PER_HOST_DELAY_MS (or the store's Crawl-delay) between requests to one store."""
+    gap = max(SETTINGS.per_host_delay_ms / 1000, float(crawl_delay or 0))
+    host = urlparse(url).netloc.lower()
+    if gap > 0:
+        remaining = _last_request.get(host, 0) + gap - time.monotonic()
+        if remaining > 0:
+            _stop.wait(min(remaining, 60))
+    if len(_last_request) > MAX_TRACKED_HOSTS:
+        _last_request.clear()
+    _last_request[host] = time.monotonic()
+
+
+def fetch_store_page(client: httpx.Client, url: str) -> FetchResult:
+    """Fetch a page of the store itself: robots.txt is checked and requests are paced."""
+    crawl_delay = None
+    if SETTINGS.respect_robots:
+        rules = robots_for(client, url)
+        if rules is not None:
+            if not rules.can_fetch("*", url):
+                return FetchResult(url, url, error="robots.txt disallows this URL")
+            crawl_delay = rules.crawl_delay("*")
+    wait_for_host(url, crawl_delay)
+    return fetch_http(client, url)
 
 
 def fetch_http(client: httpx.Client, url: str) -> FetchResult:
@@ -397,7 +463,7 @@ def extract_shopify(url: str, shopify_product_id: str | None, client: httpx.Clie
     js_url = shopify_json_url(url)
     if not js_url or not shopify_product_id:
         return None
-    fetched = fetch_http(client, js_url)
+    fetched = fetch_store_page(client, js_url)
     if fetched.error or fetched.status != 200:
         return None
     try:
@@ -466,7 +532,9 @@ def extract_product(
             return Outcome("not_found", url, error=f"product_mismatch: {shopify.error}", http_status=200)
         images.extend(shopify.images)  # images in the product's own description first
 
-    fetched = fetch_http(client, url)
+    fetched = fetch_store_page(client, url)
+    if fetched.error == "robots.txt disallows this URL":
+        return Outcome("blocked", url, error=fetched.error)
     store_chart: Outcome | None = None
     if fetched.error:
         errors.append(f"http: {fetched.error}")
@@ -601,7 +669,9 @@ _CLAIM_PRODUCTS = """
                   WHEN 'ocr_review'  THEN %(ocr_review)s * INTERVAL '1 second'
               END
           )
-        ORDER BY k.checked_at ASC NULLS FIRST, p.id
+        -- Spread each batch across stores (a store's products have consecutive
+        -- ids) so per-store pacing rarely waits and no store gets bursts.
+        ORDER BY k.checked_at ASC NULLS FIRST, (p.id * 2654435761) %% 4294967291, p.id
         LIMIT %(limit)s
         FOR UPDATE OF p SKIP LOCKED
     ),

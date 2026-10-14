@@ -56,6 +56,7 @@ OCR_READING = {
              for s, c, l in (("S", "96", "102"), ("M", "101", "104"), ("L", "106", "106"))],
 }
 GEMINI_READINGS: list = []
+ROBOTS_DISALLOW = chr(10).join(["User-agent: *", "Disallow: /products/", ""])
 KIWI_RESPONSE = (FIXTURES / "kiwi_poshakhub_response.json").read_text(encoding="utf-8")
 KIWI_SNIPPET = (FIXTURES / "kiwi_poshakhub_snippet.html").read_text(encoding="utf-8").replace(
     "9121477034235", str(SHOPIFY_ID))
@@ -153,6 +154,8 @@ def http(monkeypatch):
         if request.url.path in SHOPIFY_JSON:
             return httpx.Response(200, text=json.dumps(SHOPIFY_JSON[request.url.path]),
                                   headers={"content-type": "application/json"})
+        if request.url.host == "private.example.com" and request.url.path == "/robots.txt":
+            return httpx.Response(200, text=ROBOTS_DISALLOW)
         status, body = PAGES.get(request.url.path, (404, "not found"))
         return httpx.Response(status, text=body, headers={"content-type": "text/html"})
 
@@ -161,6 +164,9 @@ def http(monkeypatch):
     monkeypatch.setattr(worker.SETTINGS, "browser_enabled", False)
     monkeypatch.setattr(worker.SETTINGS, "batch_size", 20)
     monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "")
+    monkeypatch.setattr(worker.SETTINGS, "per_host_delay_ms", 0)
+    worker._robots.clear()
+    worker._last_request.clear()
     ocr.clear_cache()
     yield calls
     client.close()
@@ -240,7 +246,8 @@ def test_shopify_json_description_chart_saved(conn, http):
     assert row["source_url"] == "https://store.example.com/products/shopify-chart"
     assert check(conn, 10) == "found"
     # The id-checked JSON was enough; the HTML page was never fetched.
-    assert http == ["https://store.example.com/products/shopify-chart.js"]
+    assert http == ["https://store.example.com/robots.txt",
+                    "https://store.example.com/products/shopify-chart.js"]
 
     # Found products are not picked again.
     assert worker.process_once() == 0
@@ -473,3 +480,11 @@ def test_long_values_never_abort_the_save(conn, http):
     assert row["chart_type"] == "measurement"
     assert row["unit"] == "centimetres-long"             # cut to 16 instead of failing
     assert row["chart"]["method"] == "browser_embedded_json_html"   # full name kept in JSON
+
+
+def test_robots_txt_disallow_is_respected(conn, http):
+    add_product(conn, 96, "https://private.example.com/products/kurta")
+    worker.process_once()
+    assert check(conn, 96) == "blocked"
+    assert "https://private.example.com/products/kurta" not in http      # page never fetched
+    assert "https://private.example.com/products/kurta.js" not in http

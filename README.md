@@ -41,6 +41,13 @@ No migration is needed; the worker uses the existing tables as they are.
 JSONB doesn't keep key order, so `size_order` holds the chart's size order.
 The `unit` column is `inch`, `cm`, `mm`, or `unknown` when the page doesn't say.
 
+## Politeness
+
+- Each store's `robots.txt` is read (cached 6 hours) and disallowed URLs are not fetched.
+- Requests to one store are spaced by `PER_HOST_DELAY_MS` (or its `Crawl-delay`).
+- Batches are spread across stores, so one worker never works through a single store back to back.
+- CAPTCHAs / bot protection are recorded as `blocked` and never bypassed.
+
 ## How products are picked
 
 Each batch claims active products that are either unchecked or due for a
@@ -118,10 +125,12 @@ CAPTCHAs and bot protection are recorded as `blocked`, never bypassed.
 | `HTTP_TIMEOUT_SECONDS` | `25` | per request |
 | `NAV_TIMEOUT_MS` | `45000` | browser page load |
 | `BROWSER_WAIT_MS` | `1500` | wait after load / after clicking the size guide |
-| `BROWSER_ENABLED` | `true` | `false` = HTTP only |
+| `BROWSER_ENABLED` | `true` | `false` = HTTP only (recommended: no chart so far needed the browser, and it costs 10-15 s per product) |
 | `BROWSER_RESTART_EVERY` | `50` | restart Chromium after N pages |
 | `MAX_CHART_ROWS` | `100` | larger "charts" are rejected |
 | `MAX_HTML_BYTES` | `8000000` | max page download |
+| `PER_HOST_DELAY_MS` | `1000` | minimum gap between requests to the same store (a larger robots.txt `Crawl-delay` wins) |
+| `RESPECT_ROBOTS_TXT` | `true` | skip store URLs that the store's robots.txt disallows (recorded as `blocked`) |
 | `GEMINI_API_KEY` | empty | enables OCR of size-chart images; keep it secret (runtime only) |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Gemini model used for OCR |
 | `OCR_ENABLED` | `true` | `false` turns OCR off even with a key |
