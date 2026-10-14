@@ -503,3 +503,19 @@ def test_shopify_json_description_without_chart():
 ])
 def test_shopify_json_url(url, expected):
     assert shopify_json_url(url) == expected
+
+
+def test_swatch_links_and_product_photos_are_not_chart_images():
+    # Real case (buywithouttravel.com): "More shades" swatches next to a "Size & fit guide" link.
+    html = page("""<div class="simi-box-d">More shades: <a href="#">Size &amp; fit guide</a>
+      <a href="/products/gold-emerald-necklace"><img src="/files/GoldEmerald_2.png?width=300"
+         alt="Gold Emerald Diamante teardrop Pendant Necklace"></a>
+      <a href="/products/gold-heart"><img src="/files/GoldHeart.png"></a></div>
+      <div><h4>Size &amp; fit guide</h4><img src="/files/photo.jpg" alt="Model wearing the necklace"></div>""")
+    soup = BeautifulSoup(html, "lxml")
+    assert find_size_chart_images(soup, "https://store.example.com/products/x") == []
+
+
+def test_unlabelled_image_next_to_size_chart_heading_still_found():
+    soup = BeautifulSoup(page('<div><h4>Size Chart</h4><img src="/files/table123.png"></div>'), "lxml")
+    assert [i["url"] for i in find_size_chart_images(soup, "https://e.com/p")] == ["https://e.com/files/table123.png"]

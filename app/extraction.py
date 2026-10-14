@@ -999,14 +999,20 @@ def find_size_chart_images(soup, base_url: str = "") -> list[dict[str, str]]:
             pass
 
         attrs = f"{img.get('alt', '')} {img.get('title', '')}"
+        # An image linking to a product page is a swatch / related product, not a chart.
+        link = img.find_parent("a", href=True)
+        if link is not None and "/products/" in link["href"] and not _IMAGE_KEYWORD_RE.search(attrs + src):
+            continue
         reason = None
         if _IMAGE_KEYWORD_RE.search(attrs):
             reason = "alt_or_title"
         elif _IMAGE_KEYWORD_RE.search(src):
             reason = "url"
-        else:
+        elif not clean_text(attrs):
             # Only small wrappers count as "near": a page-level container that
             # mentions "size chart" somewhere says nothing about this image.
+            # Images with their own alt text (product photos carry the product
+            # name) describe themselves, so nearby text doesn't apply to them.
             container = img.parent
             for _ in range(2):
                 if container is None or container.name in ("body", "html", "[document]"):

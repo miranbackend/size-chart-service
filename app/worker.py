@@ -724,6 +724,11 @@ def apply_ocr(outcome: Outcome, product: dict[str, Any]) -> Outcome:
     cached, since store-wide images repeat on every product). A chart is
     saved only if exactly one distinct chart matches the product's sizes.
     """
+    if not product.get("sizes"):
+        # An image chart is only accepted when its sizes match the product's
+        # sizes, so without sizes (jewellery, bags) OCR can never succeed.
+        return Outcome("not_found", outcome.source_url, images=outcome.images,
+                       error="size chart image found but the product has no sizes to check it against")
     found, statuses, errors = [], [], []
     for image in outcome.images[: max(1, SETTINGS.ocr_max_images)]:
         scope = "product" if image.get("in_product_description") else "store"

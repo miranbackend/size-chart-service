@@ -449,3 +449,12 @@ def test_several_different_store_images_go_to_review(conn, http, monkeypatch):
     worker.process_once()
     assert check(conn, 92) == "ocr_review"
     assert chart_row(conn, 92) is None
+
+
+def test_no_ocr_for_products_without_sizes(conn, http, monkeypatch):
+    monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "test-key")
+    PAGES["/products/necklace"] = (200, STORE_IMAGES_PAGE)
+    add_product(conn, 93, "https://store.example.com/products/necklace", sizes=())
+    worker.process_once()
+    assert check(conn, 93) == "not_found"
+    assert not any("googleapis" in u for u in http)            # Gemini never called
