@@ -56,6 +56,7 @@ OCR_READING = {
              for s, c, l in (("S", "96", "102"), ("M", "101", "104"), ("L", "106", "106"))],
 }
 GEMINI_READINGS: list = []
+KIWI_DOWN: list = []
 ROBOTS_DISALLOW = chr(10).join(["User-agent: *", "Disallow: /products/", ""])
 KIWI_RESPONSE = (FIXTURES / "kiwi_poshakhub_response.json").read_text(encoding="utf-8")
 KIWI_SNIPPET = (FIXTURES / "kiwi_poshakhub_snippet.html").read_text(encoding="utf-8").replace(
@@ -143,6 +144,8 @@ def http(monkeypatch):
             return httpx.Response(200, text=myntra, headers={"content-type": "text/html"})
         if request.url.host == "app.kiwisizing.com":
             assert request.url.params["product"] == str(SHOPIFY_ID)
+            if KIWI_DOWN:
+                return httpx.Response(503, text="unavailable")
             return httpx.Response(200, text=KIWI_RESPONSE, headers={"content-type": "application/json"})
         if request.url.host == "generativelanguage.googleapis.com":
             reading = GEMINI_READINGS.pop(0)
@@ -488,3 +491,14 @@ def test_robots_txt_disallow_is_respected(conn, http):
     assert check(conn, 96) == "blocked"
     assert "https://private.example.com/products/kurta" not in http      # page never fetched
     assert "https://private.example.com/products/kurta.js" not in http
+
+
+def test_kiwi_outage_is_retried_not_marked_not_found(conn, http):
+    KIWI_DOWN.append(True)
+    try:
+        add_product(conn, 97, "https://store.example.com/products/kiwi")
+        worker.process_once()
+        assert check(conn, 97) == "failed"          # retried after 6 hours, not 30 days
+        assert chart_row(conn, 97) is None
+    finally:
+        KIWI_DOWN.clear()

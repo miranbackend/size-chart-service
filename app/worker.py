@@ -523,6 +523,7 @@ def extract_product(
     client = http_client or get_http_client()
     images: list[dict[str, str]] = []
     errors: list[str] = []
+    app_failed = False  # a size-chart app's API failed: retry soon instead of not_found
 
     shopify = extract_shopify(url, shopify_product_id, client)
     if shopify is not None:
@@ -566,6 +567,7 @@ def extract_product(
             return Outcome("found", fetched.final_url, chart=kiwi.chart, http_status=fetched.status)
         if kiwi is not None and kiwi.error:
             errors.append(kiwi.error)
+            app_failed = app_failed or kiwi.status == "failed"
 
         app = relentless_page_result(fetched.html, fetched.final_url,
                                      known_product_ids[0] if known_product_ids else None,
@@ -602,6 +604,8 @@ def extract_product(
                 return terminal
             images.extend(i for i in page.images if i not in images)
 
+    if app_failed:
+        return Outcome("failed", url, error="; ".join(errors), http_status=fetched.status)
     if images:
         return Outcome("image_chart", url, images=images,
                        error="size chart image found; OCR not available")
