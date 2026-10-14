@@ -653,6 +653,7 @@ def chart_document(chart: Chart) -> dict[str, Any]:
     """
     return {
         "chart_scope": chart.evidence.get("chart_scope", "store"),
+        "method": chart.method,
         "sizes": chart.sizes,
         "size_order": list(chart.sizes),
         "unit": chart.unit,
@@ -664,21 +665,74 @@ def chart_document(chart: Chart) -> dict[str, Any]:
     }
 
 
+# Values stored in product_size_charts' short varchar columns (production
+# has varchar(16)); the full method name is kept in chart JSON.
+CHART_TYPE_DB = "measurement"
+METHOD_DB = {
+    "shopify_description": "shopify_desc",
+    "embedded_json_html": "json_in_html",
+}
+
+
+def method_db_name(method: str) -> str:
+    """Short extraction_method; browser rendering is recorded in `source`."""
+    base = method[len("browser_"):] if method.startswith("browser_") else method
+    return METHOD_DB.get(base, base)
+
+
+def source_db_name(chart: Chart) -> str:
+    if chart.source == "image":
+        return "image"
+    if chart.method == "kiwi_app":
+        return "kiwi"
+    if chart.method == "size_chart_app":
+        return "app"
+    return "browser" if chart.method.startswith("browser_") else "html"
+
+
+_column_limits: dict[tuple[str, str], int] | None = None
+
+
+def column_limits(conn) -> dict[tuple[str, str], int]:
+    """varchar(n) limits of the columns the worker writes, read once per process."""
+    global _column_limits
+    if _column_limits is None:
+        rows = conn.execute(
+            """
+            SELECT table_name, column_name, character_maximum_length
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name IN ('product_size_charts', 'product_size_chart_checks')
+              AND character_maximum_length IS NOT NULL
+            """
+        ).fetchall()
+        _column_limits = {(t, c): n for t, c, n in rows}
+    return _column_limits
+
+
+def fit(conn, table: str, column: str, value: str | None) -> str | None:
+    """Never let a long value abort the save: cut it to the column's limit, loudly."""
+    limit = column_limits(conn).get((table, column))
+    if value is not None and limit and len(value) > limit:
+        log.warning("value %r too long for %s.%s varchar(%s); truncated", value, table, column, limit)
+        return value[:limit]
+    return value
+
+
 def save_chart(conn, product_id: int, chart: Chart, source_url: str) -> int:
     if len(chart.sizes) < 2:
         raise ValueError(f"refusing to save chart with {len(chart.sizes)} size rows")
+    t = "product_size_charts"
     conn.execute(
         _UPSERT_CHART,
         (
             product_id,
             Jsonb(chart_document(chart)),
-            chart.chart_type,
-            chart.unit or "unknown",  # unit is NOT NULL
-            "image" if chart.source == "image" else
-            "kiwi" if chart.method == "kiwi_app" else
-            "browser" if chart.method.startswith("browser_") else "html",
+            fit(conn, t, "chart_type", CHART_TYPE_DB),
+            fit(conn, t, "unit", chart.unit or "unknown"),  # unit is NOT NULL
+            fit(conn, t, "source", source_db_name(chart)),
             source_url,
-            chart.method,
+            fit(conn, t, "extraction_method", method_db_name(chart.method)),
         ),
     )
     return len(chart.sizes)
@@ -692,7 +746,7 @@ def record_check(conn, product_id: int, result: str) -> None:
         ON CONFLICT (product_id) DO UPDATE
             SET result = EXCLUDED.result, checked_at = EXCLUDED.checked_at
         """,
-        (product_id, result),
+        (product_id, fit(conn, "product_size_chart_checks", "result", result)),
     )
 
 
