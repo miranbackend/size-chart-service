@@ -519,3 +519,44 @@ def test_swatch_links_and_product_photos_are_not_chart_images():
 def test_unlabelled_image_next_to_size_chart_heading_still_found():
     soup = BeautifulSoup(page('<div><h4>Size Chart</h4><img src="/files/table123.png"></div>'), "lxml")
     assert [i["url"] for i in find_size_chart_images(soup, "https://e.com/p")] == ["https://e.com/files/table123.png"]
+
+
+# ------------------------------------------------------------------
+# "Size Charts by Relentless" app (real perini.in snippet)
+# ------------------------------------------------------------------
+
+from extraction import relentless_page_result  # noqa: E402
+
+
+def test_relentless_app_image_chart_from_real_page():
+    html = (FIXTURES / "relentless_perini_snippet.html").read_text(encoding="utf-8")
+    r = relentless_page_result(html, "https://perini.in/products/purple-pleated-embellished-dress",
+                               "15395957211417")
+    assert r.status == "image_chart"
+    assert r.evidence["chart_scope"] == "store"            # conditionsOperator: all-products
+    assert len(r.images) == 1
+    assert r.images[0]["url"].startswith("https://d17fzo7x83uajt.cloudfront.net/")
+    assert r.images[0]["scope"] == "store"
+
+
+def test_relentless_app_filled_table():
+    chart = {"id": "1", "title": "Size Chart", "conditionsOperator": "all-products",
+             "values": [["Size", "Chest (in)", "Length (in)"], ["S", "38", "27"], ["M", "40", "28"]],
+             "descriptionTop": "", "descriptionBottom": ""}
+    html = page(f"<script>var sizeChartsRelentless = {{}}; sizeChartsRelentless._x = {json.dumps([chart])};</script>")
+    r = relentless_page_result(html, "https://store.example.com/products/x", "123")
+    assert r.status == "found"
+    assert r.chart.sizes == {"S": {"chest": "38", "length": "27"}, "M": {"chest": "40", "length": "28"}}
+    assert r.chart.evidence["chart_scope"] == "store"
+    assert r.chart.method == "size_chart_app"
+
+
+def test_relentless_several_charts_not_guessed():
+    charts = [{"id": str(i), "title": "Size Chart", "conditionsOperator": "any",
+               "values": [["Size", "Chest"], ["S", "38"], ["M", "40"]]} for i in (1, 2)]
+    html = page(f"<script>var sizeChartsRelentless = {{}}; sizeChartsRelentless._x = {json.dumps(charts)};</script>")
+    assert relentless_page_result(html, "https://store.example.com/products/x", "123").status == "not_found"
+
+
+def test_page_without_the_app():
+    assert relentless_page_result(page("<p>x</p>"), "https://store.example.com/products/x", "1") is None

@@ -73,7 +73,9 @@ _RULES = (
     "If the image contains more than one chart (for example for different products or categories), "
     "set chart_count to how many there are. "
     "Measurement names are the column/row headers such as Chest, Waist, Hip, Length, Shoulder, Sleeve, Inseam. "
-    "Size-conversion columns (UK, US, EU) and anything that is not a body or garment measurement are not measurements."
+    "Size-conversion columns (UK, US, EU) and anything that is not a body or garment measurement are not measurements. "
+    "If a measurement is shown in more than one unit, give one entry per unit with the unit in the name, "
+    "for example 'Bust (in)' and 'Bust (cm)', and set unit to inch when inch values are present."
 )
 PROMPTS = (
     "This image is from a clothing product's description. Transcribe the size chart into JSON: "
@@ -96,18 +98,33 @@ class GeminiError(Exception):
     pass
 
 
+def sniff_image_type(data: bytes) -> str | None:
+    """Image type from the file's signature bytes."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def fetch_image(client: httpx.Client, url: str) -> tuple[bytes, str]:
     with client.stream("GET", url) as response:
         if response.status_code != 200:
             raise GeminiError(f"image HTTP {response.status_code}")
-        mime = response.headers.get("content-type", "").split(";")[0].strip().lower()
-        if mime not in IMAGE_TYPES:
-            raise GeminiError(f"unsupported image type {mime or 'unknown'}")
+        declared = response.headers.get("content-type", "").split(";")[0].strip().lower()
+        if declared and not (declared.startswith("image") or declared == "application/octet-stream"):
+            raise GeminiError(f"unsupported image type {declared}")
         data = bytearray()
         for chunk in response.iter_bytes():
             data.extend(chunk)
             if len(data) > MAX_IMAGE_BYTES:
                 raise GeminiError("image larger than 5 MB")
+    # Some image servers send a vague type ("image"); trust the file's own signature.
+    mime = declared if declared in IMAGE_TYPES else sniff_image_type(bytes(data))
+    if mime not in IMAGE_TYPES:
+        raise GeminiError(f"unsupported image type {declared or 'unknown'}")
     return bytes(data), mime
 
 
@@ -154,6 +171,7 @@ def ask_gemini(client: httpx.Client, api_key: str, model: str, prompt: str,
 
 
 def reading_to_sizes(reading: dict) -> dict[str, dict[str, str]]:
+    chart_unit = normalize_unit(reading.get("unit"))
     sizes: dict[str, dict[str, str]] = {}
     for row in reading.get("rows") or []:
         if not isinstance(row, dict):
@@ -165,8 +183,14 @@ def reading_to_sizes(reading: dict) -> dict[str, dict[str, str]]:
         for entry in row.get("measurements") or []:
             if not isinstance(entry, dict):
                 continue
-            key, _unit = canonical_measurement_key(entry.get("name"))
-            if is_measurement_key(key) and key not in measurements:
+            key, unit = canonical_measurement_key(entry.get("name"))
+            if not is_measurement_key(key):
+                continue
+            # A column in another unit than the chart's ("Bust (cm)" on an
+            # inch chart) is kept separately as bust_cm, as for HTML tables.
+            if unit and chart_unit and unit != chart_unit:
+                key = f"{key}_{unit}"
+            if key not in measurements:
                 measurements[key] = clean_text(entry.get("value"))
         sizes[label] = measurements
     return sizes

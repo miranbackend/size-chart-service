@@ -48,6 +48,7 @@ from extraction import (
     KIWI_API,
     kiwi_page_result,
     kiwi_request_params,
+    relentless_page_result,
     is_google_url,
     shopify_json_url,
 )
@@ -498,6 +499,16 @@ def extract_product(
         if kiwi is not None and kiwi.error:
             errors.append(kiwi.error)
 
+        app = relentless_page_result(fetched.html, fetched.final_url,
+                                     known_product_ids[0] if known_product_ids else None,
+                                     SETTINGS.max_chart_rows)
+        if app is not None and app.status == "found":
+            return Outcome("found", fetched.final_url, chart=app.chart, http_status=fetched.status)
+        if app is not None and app.status == "image_chart":
+            images.extend(i for i in app.images if i not in images)
+        elif app is not None and app.error:
+            errors.append(app.error)
+
         if store_chart:
             return store_chart
         if page.authoritative and page.status == "not_found":
@@ -731,7 +742,7 @@ def apply_ocr(outcome: Outcome, product: dict[str, Any]) -> Outcome:
                        error="size chart image found but the product has no sizes to check it against")
     found, statuses, errors = [], [], []
     for image in outcome.images[: max(1, SETTINGS.ocr_max_images)]:
-        scope = "product" if image.get("in_product_description") else "store"
+        scope = image.get("scope") or ("product" if image.get("in_product_description") else "store")
         result = read_chart_image(
             get_http_client(), image["url"],
             api_key=SETTINGS.gemini_api_key, model=SETTINGS.gemini_model,

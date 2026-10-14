@@ -124,3 +124,25 @@ def test_non_image_url_rejected():
 def test_size_overlap(chart_sizes, product_sizes, overlap):
     from ocr import size_overlap
     assert size_overlap(chart_sizes, product_sizes) == overlap
+
+
+def test_two_unit_chart_keeps_both_units():
+    # Real case (perini.in): bust/waist/hips given in IN and CM side by side.
+    def row(size, b_in, b_cm):
+        return {"size": size, "measurements": [{"name": "Bust (in)", "value": b_in},
+                                                {"name": "Bust (cm)", "value": b_cm}]}
+    reading = {"is_measurement_chart": True, "chart_count": 1, "unit": "inch", "measurement_basis": "body",
+               "rows": [row("XS", "32", "81.3"), row("S", "34", "86.4"), row("M", "36", "91.4")]}
+    r = read(client_for([reading, reading]), sizes=("XS", "S", "M", "L"))
+    assert r.status == "found"
+    assert r.chart.unit == "inch"
+    assert r.chart.sizes["S"] == {"bust": "34", "bust_cm": "86.4"}
+    assert r.chart.measurement_basis == "body"
+
+
+def test_image_type_from_file_signature_when_server_is_vague():
+    from ocr import sniff_image_type
+    assert sniff_image_type(b"\xff\xd8\xff\xe0rest") == "image/jpeg"
+    assert sniff_image_type(b"\x89PNG\r\n\x1a\nrest") == "image/png"
+    assert sniff_image_type(b"RIFF\x00\x00\x00\x00WEBPrest") == "image/webp"
+    assert sniff_image_type(b"<html>") is None

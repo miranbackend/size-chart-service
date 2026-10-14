@@ -1695,3 +1695,101 @@ def kiwi_page_result(response: Any, product_id: str, url: str,
     best = candidates[0]
     evidence = {"site": "kiwi", "kiwi_charts": len(candidates)}
     return _found(best, "kiwi", "", evidence, None, strong_id=True)
+
+
+# ============================================================
+# "SIZE CHARTS BY RELENTLESS" APP (Best Fit Size Charts)
+# ============================================================
+
+_RELENTLESS_ASSIGN_RE = re.compile(r'sizeChartsRelentless\.([\w.]+)\s*=\s*(?=\[\{)')
+
+
+def relentless_charts(html: str) -> list[dict] | None:
+    """The app's chart objects, embedded in the product page by the app block."""
+    start = (html or "").find("sizeChartsRelentless")
+    if start < 0:
+        return None
+    end = html.find("</script>", start)
+    block = html[start:end if end > 0 else start + 2_000_000]
+    for m in _RELENTLESS_ASSIGN_RE.finditer(block):
+        try:
+            value, _ = json.JSONDecoder().raw_decode(block, m.end())
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        if isinstance(value, list) and value and all(isinstance(c, dict) for c in value) \
+                and any("values" in c or "descriptionTop" in c for c in value):
+            unique = {}
+            for chart in value:
+                unique.setdefault(str(chart.get("id")), chart)
+            return list(unique.values())
+    return None
+
+
+def _app_html(value: Any) -> str:
+    text = value if isinstance(value, str) else ""
+    if text.startswith('"'):
+        try:
+            text = json.loads(text)
+        except json.JSONDecodeError:
+            pass
+    return text if isinstance(text, str) else ""
+
+
+def relentless_page_result(
+    html: str,
+    url: str,
+    product_id: str | None,
+    max_rows: int = DEFAULT_MAX_CHART_ROWS,
+) -> PageResult | None:
+    """
+    The chart this app shows for the product: its table if filled in,
+    otherwise its chart image(s) for OCR. None when the app isn't on the page.
+    """
+    charts = relentless_charts(html)
+    if not charts:
+        return None
+    if len(charts) > 1:
+        named = [c for c in charts if product_id and str(product_id) in json.dumps(c)]
+        if len(named) != 1:
+            return PageResult(status="not_found",
+                              error=f"size chart app: {len(charts)} charts, can't tell which applies")
+        charts = named
+    chart = charts[0]
+
+    if product_id and str(product_id) in json.dumps(chart):
+        scope = "product"
+    elif chart.get("conditionsOperator") == "all-products":
+        scope = "store"
+    else:
+        scope = "collection"
+    evidence = {"site": "size_chart_app", "app": "relentless", "chart_scope": scope,
+                "app_chart_id": chart.get("id"), "app_chart_title": chart.get("title")}
+
+    rows = [[clean_text(BeautifulSoup(str(cell), "lxml").get_text(" ")) for cell in row]
+            for row in chart.get("values") or [] if isinstance(row, list)]
+    parsed = rows_to_sizes(rows) if any(any(r) for r in rows) else None
+    if parsed:
+        sizes, unit, raw = parsed
+        clean, _reason = validate_chart(sizes, max_rows)
+        if clean:
+            cand = Candidate(sizes=clean, unit=unit, method="size_chart_app", confidence=0.80,
+                             evidence=dict(evidence), raw=raw)
+            return _found(cand, "size_chart_app", "", evidence, None, strong_id=True)
+
+    content = _app_html(chart.get("descriptionTop")) + _app_html(chart.get("descriptionBottom"))
+    soup = BeautifulSoup(content[:MAX_EMBEDDED_HTML_CHARS], "lxml")
+    for cand in extract_from_html(soup, max_rows):
+        cand.method = "size_chart_app"
+        cand.evidence.update(evidence)
+        return _found(cand, "size_chart_app", "", evidence, None, strong_id=True)
+
+    images = []
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src")
+        if src and not src.startswith("data:"):
+            images.append({"url": urljoin(url, src), "reason": "size_chart_app", "scope": scope,
+                           "in_product_description": scope == "product"})
+    if images:
+        return PageResult(status="image_chart", images=images[:MAX_IMAGE_CANDIDATES], evidence=evidence,
+                          error="size chart app shows an image")
+    return PageResult(status="not_found", evidence=evidence, error="size chart app chart is empty")

@@ -74,9 +74,13 @@ Sources, best first (the first that yields a valid chart wins):
    makes (`app.kiwisizing.com/api/getSizingChart` with the page's product id, collections, tags,
    vendor) and parses Kiwi's table. Scope from Kiwi's own matching rule: `product` when matched to
    this product id, otherwise `collection`.
-4. **Other tables on the page** (theme size guide) → scope `store`.
-5. **Headless Chromium**, for pages that loaded with no chart and no chart image.
-6. **Size-chart images** → OCR (below). Description images are tried before store-wide images.
+4. **"Size Charts by Relentless" app** (Best Fit Size Charts): the app embeds its charts in the
+   page (`sizeChartsRelentless`). Its table is used if filled in, otherwise its chart image goes to
+   OCR. Scope: `store` for `all-products`, `product` if the chart names this product, else
+   `collection`. If several app charts could apply, none is used.
+5. **Other tables on the page** (theme size guide) → scope `store`.
+6. **Headless Chromium**, for pages that loaded with no chart and no chart image.
+7. **Size-chart images** → OCR (below). Description images are tried before store-wide images.
 
 Every chart is validated: at least 2 sizes, each with at least one recognised measurement field
 (chest, waist, hip, length, sleeve, inseam, …) and a numeric value.
