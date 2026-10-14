@@ -1,8 +1,12 @@
 # Size-chart worker
 
-Finds the product-specific measurement chart (chest, waist, length, …) for
-each active row in `products` and saves it to `product_size_charts`.
-Available/purchasable sizes alone are never treated as a chart.
+Finds the measurement chart (chest, waist, length, …) that belongs to each
+active product in `products` and saves it to `product_size_charts`.
+
+Only a chart that provably belongs to that product is saved. Store-wide or
+category size guides (theme popups, size-chart apps, the same table on every
+page) are recorded as `generic_chart` and not saved. Available/purchasable
+sizes are never treated as a chart.
 
 ## Tables
 
@@ -44,7 +48,8 @@ same product. Unchecked products come first.
 |---|---|---|
 | `found` | chart saved to `product_size_charts` | never (automatically) |
 | `not_found` | no product-specific measurement chart, or the page is a different product | 30 days |
-| `pending_ocr` | only a size-chart image was found (nothing saved) | 30 days |
+| `generic_chart` | a chart exists but isn't tied to this product (store-wide/category guide): not saved | 30 days |
+| `pending_ocr` | a size-chart image in the product's own description (nothing saved; needs OCR) | 30 days |
 | `blocked` | CAPTCHA / anti-bot / HTTP 403 / 429 | 24 hours |
 | `failed` | network or unexpected error | 6 hours |
 | `processing` | being worked on now; older than 30 min means a worker died | 30 minutes |
@@ -55,18 +60,24 @@ its row from `product_size_chart_checks`.
 
 ## Extraction
 
-1. Fetch the product page over HTTP (size-capped, realistic headers, timeouts).
-2. Extract, in priority order:
-   1. Retailer-specific embedded JSON (Myntra `window.__myx.pdpData.sizes[].measurements`, product id must match the URL).
-   2. Generic embedded JSON (`ld+json`, `__NEXT_DATA__`, `window.__INITIAL_STATE__ = …`).
-   3. HTML `<table>` charts, including transposed ones.
-   4. Headless Chromium, only if the page loaded but had no chart. It clicks a size-guide control once, for charts rendered by JavaScript apps.
-   5. Size-chart images. These are recorded as `pending_ocr`; nothing is saved.
-3. Validate: at least 2 sizes, each with at least one recognised measurement field and a numeric value. Stock, price and size-conversion columns never count.
-4. Check it's the same product: `shopify_product_id` appearing in the page is strong evidence. Without an id match, a page whose title clearly differs from `products.title` is rejected.
-5. Save the chart and the check result in one transaction.
+A chart is saved only from a source tied to this one product:
 
-CAPTCHAs and bot protection are detected and recorded as `blocked`, never bypassed.
+1. **Shopify product JSON** (`<product_url>.js`). Its `id` must equal
+   `products.shopify_product_id`. A measurement table in its `description` (the
+   merchant's per-product description) is that product's chart. When this JSON is
+   available the page isn't fetched. A wrong `id` gives `not_found` (product mismatch).
+2. **The product page** (stores without that JSON), keeping only:
+   - retailer data tied to the product id (e.g. Myntra `window.__myx.pdpData.sizes[].measurements`, id must match the URL),
+   - embedded JSON found under the product's own id,
+   - a `<table>` inside the product's description block (`itemprop="description"` or a description class/id).
+   Any other chart on the page is `generic_chart`.
+3. **Headless Chromium**, only for non-Shopify pages that loaded with no chart at all (it clicks a size-guide control once). The same rules apply.
+
+Every chart is also validated: at least 2 sizes, each with at least one
+recognised measurement field (chest, waist, hip, length, sleeve, inseam, …) and a numeric value.
+Stock, price and size-conversion columns never count. Size-chart images are
+never saved; one inside the description is recorded as `pending_ocr`.
+CAPTCHAs and bot protection are recorded as `blocked`, never bypassed.
 
 ## Settings
 

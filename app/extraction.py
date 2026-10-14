@@ -917,6 +917,28 @@ def _table_context(table) -> str:
     return " ".join(parts)
 
 
+_DESCRIPTION_RE = re.compile(r"description", re.I)
+
+
+def in_product_description(element) -> bool:
+    """
+    True when the element sits inside the product's description block
+    (itemprop="description" or a class/id naming the description). Content
+    there is written per product; theme size-guide popups and apps are not.
+    """
+    node = element.parent if element is not None else None
+    for _ in range(30):
+        if node is None or node.name in ("body", "html", "[document]"):
+            return False
+        if node.get("itemprop") == "description":
+            return True
+        marker = " ".join(node.get("class") or []) + " " + (node.get("id") or "")
+        if _DESCRIPTION_RE.search(marker):
+            return True
+        node = node.parent
+    return False
+
+
 def extract_from_html(soup, max_rows: int = DEFAULT_MAX_CHART_ROWS) -> list[Candidate]:
     """All valid measurement tables on the page."""
     found: list[Candidate] = []
@@ -935,7 +957,8 @@ def extract_from_html(soup, max_rows: int = DEFAULT_MAX_CHART_ROWS) -> list[Cand
             unit=unit,
             method="html_table",
             confidence=0.80 if in_size_guide else 0.75,
-            evidence={"size_guide_context": in_size_guide},
+            evidence={"size_guide_context": in_size_guide,
+                      "in_product_description": in_product_description(table)},
             raw=raw,
         ))
     return found
@@ -1002,7 +1025,8 @@ def find_size_chart_images(soup, base_url: str = "") -> list[dict[str, str]]:
         if url in seen:
             continue
         seen.add(url)
-        candidates.append({"url": url, "reason": reason})
+        candidates.append({"url": url, "reason": reason,
+                           "in_product_description": in_product_description(img)})
         if len(candidates) >= MAX_IMAGE_CANDIDATES:
             break
 
@@ -1324,6 +1348,17 @@ class PageResult:
     evidence: dict[str, Any] = field(default_factory=dict)
 
 
+def is_product_scoped(cand: Candidate) -> bool:
+    """
+    A chart is the product's own only when its source is tied to this
+    product: embedded data under the product's id, or the product's own
+    description. A table elsewhere on the page may be a store-wide chart.
+    """
+    ev = cand.evidence
+    return bool(ev.get("product_id_in_context") or ev.get("in_product_description")
+                or ev.get("product_id_match"))
+
+
 def _pick_candidate(candidates: list[Candidate]) -> tuple[Candidate, int]:
     """
     Highest-confidence candidate. When several distinct charts are present
@@ -1358,9 +1393,14 @@ def extract_page(
     via: str = "http",
     max_rows: int = DEFAULT_MAX_CHART_ROWS,
     known_product_ids: tuple[str, ...] = (),
+    product_scope_only: bool = False,
 ) -> PageResult:
     """
     Run the full extraction priority on one page.
+
+    With `product_scope_only`, only charts tied to this product (see
+    is_product_scoped) are accepted; any other chart on the page is reported
+    as status "generic_chart" and not returned.
 
     `url` is the final (post-redirect) URL; `requested_url` the URL we asked
     for, used to detect redirects away from the product. `known_product_ids`
@@ -1400,8 +1440,11 @@ def extract_page(
         images.extend(res.images)
         if res.status == "product_mismatch":
             return PageResult(status="product_mismatch", error=res.error, evidence=evidence)
-        if res.chart:
+        if res.chart and (not product_scope_only or is_product_scoped(res.chart)):
             return _found(res.chart, site, prefix, evidence, overlap, strong_id=True)
+        if res.chart:
+            return PageResult(status="generic_chart", evidence=evidence,
+                              error="retailer chart not tied to the product id in the URL")
         if res.authoritative:
             if images:
                 return PageResult(status="image_chart", images=images, error=res.error,
@@ -1411,6 +1454,13 @@ def extract_page(
 
     # 2. Generic embedded JSON, 3. HTML tables.
     candidates = extract_from_json(soup, product_ids, max_rows) + extract_from_html(soup, max_rows)
+    if product_scope_only:
+        scoped = [c for c in candidates if is_product_scoped(c)]
+        if candidates and not scoped:
+            evidence["generic_candidates"] = len(candidates)
+            return PageResult(status="generic_chart", evidence=evidence,
+                              error=f"{len(candidates)} chart(s) on page, none tied to this product")
+        candidates = scoped
     if candidates:
         best, count = _pick_candidate(candidates)
         evidence["candidate_count"] = count
@@ -1418,7 +1468,14 @@ def extract_page(
         return _found(best, site, prefix, evidence, overlap, strong_id=strong)
 
     # 5. Image candidates (OCR is a separate stage).
-    images.extend(find_size_chart_images(soup, url))
+    page_images = find_size_chart_images(soup, url)
+    if product_scope_only:
+        own = [i for i in page_images if i.get("in_product_description")]
+        if page_images and not own and not images:
+            return PageResult(status="generic_chart", evidence=evidence,
+                              error="size-chart image on page is not in the product description")
+        page_images = own
+    images.extend(page_images)
     if images:
         return PageResult(status="image_chart", images=images[:MAX_IMAGE_CANDIDATES], evidence=evidence)
 
@@ -1457,3 +1514,65 @@ def _found(
         raw={k: v for k, v in cand.raw.items() if k != "rows"},
     )
     return PageResult(status="found", chart=chart, evidence=evidence)
+
+
+# ============================================================
+# SHOPIFY PRODUCT JSON (<product_url>.js)
+# ============================================================
+
+def shopify_json_url(product_url: str) -> str | None:
+    """https://store/products/handle?variant=1 -> https://store/products/handle.js"""
+    parsed = urlparse(product_url or "")
+    path = parsed.path.rstrip("/")
+    if parsed.scheme not in ("http", "https") or "/products/" not in path:
+        return None
+    if path.endswith(".js") or path.endswith(".json"):
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}{path}.js"
+
+
+def extract_shopify_product(
+    data: Any,
+    shopify_product_id: str,
+    url: str,
+    max_rows: int = DEFAULT_MAX_CHART_ROWS,
+) -> PageResult:
+    """
+    Chart from the product's own description in Shopify's product JSON.
+    The JSON id must equal shopify_product_id; the description is written
+    per product, so a measurement table there is that product's chart.
+    """
+    if not isinstance(data, dict):
+        return PageResult(status="not_found", error="shopify: unexpected product JSON")
+    json_id = str(data.get("id") or "")
+    evidence = {"site": "shopify", "shopify_product_id": str(shopify_product_id),
+                "json_product_id": json_id or None}
+    if not json_id or json_id != str(shopify_product_id):
+        return PageResult(status="product_mismatch", evidence=evidence,
+                          error=f"shopify JSON id={json_id or None} != shopify_product_id={shopify_product_id}")
+    evidence["product_id_match"] = True
+
+    description = data.get("description") or data.get("body_html") or ""
+    if not isinstance(description, str) or not description.strip():
+        return PageResult(status="not_found", evidence=evidence, authoritative=True,
+                          error="shopify: empty product description")
+    soup = BeautifulSoup(description[:MAX_EMBEDDED_HTML_CHARS], "lxml")
+
+    candidates = extract_from_html(soup, max_rows)
+    for cand in candidates:
+        cand.method = "shopify_description"
+        cand.confidence = 0.90
+        cand.evidence.update(in_product_description=True, product_id_match=True)
+    if candidates:
+        best, count = _pick_candidate(candidates)
+        evidence["candidate_count"] = count
+        return _found(best, "shopify", "", evidence, None, strong_id=True)
+
+    images = find_size_chart_images(soup, url)
+    for image in images:
+        image["in_product_description"] = True
+    if images:
+        return PageResult(status="image_chart", images=images, evidence=evidence, authoritative=True,
+                          error="size chart image in product description; OCR not implemented")
+    return PageResult(status="not_found", evidence=evidence, authoritative=True,
+                      error="shopify: no measurement table in product description")

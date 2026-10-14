@@ -419,3 +419,87 @@ def test_package_and_image_dimensions_are_not_measurements():
     html = page(f"<script>window.__INITIAL_STATE__ = {json.dumps(data)};</script>")
     url = "https://example.com/p/8"
     assert extract_page(html, url, requested_url=url).status == "not_found"
+
+
+# ------------------------------------------------------------------
+# Product-specific only (product_scope_only=True, used by the worker)
+# ------------------------------------------------------------------
+
+from extraction import extract_shopify_product, shopify_json_url  # noqa: E402
+
+CHART_TABLE = """<table><tr><th>Size</th><th>Chest (in)</th><th>Length (in)</th></tr>
+<tr><td>S</td><td>38</td><td>27</td></tr><tr><td>M</td><td>40</td><td>28</td></tr></table>"""
+
+
+def test_strict_rejects_theme_size_guide_table():
+    html = page(f'<div class="size-guide-modal"><h3>Size Chart</h3>{CHART_TABLE}</div>')
+    url = "https://store.example.com/products/kurta"
+    r = extract_page(html, url, requested_url=url, product_scope_only=True)
+    assert r.status == "generic_chart"
+    assert r.chart is None
+    # Without the strict rule the same table would have been accepted.
+    assert extract_page(html, url, requested_url=url).status == "found"
+
+
+@pytest.mark.parametrize("wrapper", [
+    '<div class="product__description rte">{}</div>',
+    '<div class="product-single__description">{}</div>',
+    '<div itemprop="description"><section>{}</section></div>',
+])
+def test_strict_accepts_table_inside_product_description(wrapper):
+    html = page(wrapper.format(CHART_TABLE))
+    url = "https://store.example.com/products/kurta"
+    r = extract_page(html, url, requested_url=url, product_scope_only=True)
+    assert r.status == "found"
+    assert r.chart.sizes["M"] == {"chest": "40", "length": "28"}
+    assert r.chart.evidence["in_product_description"] is True
+
+
+def test_strict_image_outside_description_is_generic():
+    html = page('<div class="size-chart-popup"><img src="/size-chart.jpg" alt="Size Chart"></div>')
+    url = "https://store.example.com/products/kurta"
+    assert extract_page(html, url, requested_url=url, product_scope_only=True).status == "generic_chart"
+
+
+def test_strict_image_inside_description_is_pending_ocr():
+    html = page('<div class="product-description"><img src="/kurta-size-chart.jpg" alt="Size Chart"></div>')
+    url = "https://store.example.com/products/kurta"
+    r = extract_page(html, url, requested_url=url, product_scope_only=True)
+    assert r.status == "image_chart"
+
+
+def test_strict_keeps_myntra_product_data():
+    r = extract_page(myntra_html(), MYNTRA_URL, requested_url=MYNTRA_URL, product_scope_only=True)
+    assert r.status == "found" and len(r.chart.sizes) == 4
+
+
+def test_shopify_json_description_chart():
+    data = {"id": 7894561230123, "title": "Kurta", "description": f"<p>Soft linen.</p>{CHART_TABLE}"}
+    r = extract_shopify_product(data, "7894561230123", "https://store.example.com/products/kurta")
+    assert r.status == "found"
+    assert r.chart.method == "shopify_description"
+    assert r.chart.sizes == {"S": {"chest": "38", "length": "27"}, "M": {"chest": "40", "length": "28"}}
+    assert r.chart.evidence["product_id_match"] is True
+
+
+def test_shopify_json_wrong_product_id_rejected():
+    data = {"id": 111, "description": CHART_TABLE}
+    r = extract_shopify_product(data, "7894561230123", "https://store.example.com/products/kurta")
+    assert r.status == "product_mismatch" and r.chart is None
+
+
+def test_shopify_json_description_without_chart():
+    r = extract_shopify_product({"id": 5, "description": "<p>Linen kurta. Sizes S, M, L available.</p>"},
+                                "5", "https://store.example.com/products/kurta")
+    assert r.status == "not_found"
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://store.example.com/products/kurta", "https://store.example.com/products/kurta.js"),
+    ("https://store.example.com/collections/x/products/kurta?variant=12#top",
+     "https://store.example.com/collections/x/products/kurta.js"),
+    ("https://store.example.com/products/kurta/", "https://store.example.com/products/kurta.js"),
+    ("https://www.myntra.com/shirts/x/31472271/buy", None),
+])
+def test_shopify_json_url(url, expected):
+    assert shopify_json_url(url) == expected

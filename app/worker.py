@@ -43,7 +43,9 @@ from extraction import (
     adapter_for,
     clean_text,
     extract_page,
+    extract_shopify_product,
     is_google_url,
+    shopify_json_url,
 )
 
 
@@ -212,7 +214,7 @@ class FetchResult:
     truncated: bool = False
 
 
-_TEXT_CONTENT_TYPES = ("html", "json", "text/plain", "xml")
+_TEXT_CONTENT_TYPES = ("html", "json", "javascript", "text/plain", "xml")
 
 
 def fetch_http(client: httpx.Client, url: str) -> FetchResult:
@@ -349,7 +351,7 @@ def get_browser() -> BrowserFetcher | None:
 
 @dataclass
 class Outcome:
-    """status: found | not_found | blocked | image_chart | failed"""
+    """status: found | not_found | generic_chart | blocked | image_chart | failed"""
     status: str
     source_url: str | None = None
     chart: Chart | None = None
@@ -367,11 +369,33 @@ def _outcome_from_page(page: PageResult, fetched: FetchResult) -> Outcome | None
     if page.status == "product_mismatch":
         return Outcome("not_found", fetched.final_url, error=f"product_mismatch: {page.error}",
                        http_status=fetched.status)
+    if page.status == "generic_chart":
+        return Outcome("generic_chart", fetched.final_url, error=page.error, http_status=fetched.status)
     if page.authoritative:
         status = "image_chart" if page.status == "image_chart" else "not_found"
         return Outcome(status, fetched.final_url, error=page.error, images=page.images,
                        http_status=fetched.status)
     return None
+
+
+def extract_shopify(url: str, shopify_product_id: str | None, client: httpx.Client) -> Outcome | None:
+    """
+    Chart from the product's own description in <product_url>.js, after
+    checking the JSON id equals shopify_product_id. Returns None when the
+    store does not serve that JSON, so the product page is used instead.
+    """
+    js_url = shopify_json_url(url)
+    if not js_url or not shopify_product_id:
+        return None
+    fetched = fetch_http(client, js_url)
+    if fetched.error or fetched.status != 200:
+        return None
+    try:
+        data = json.loads(fetched.html)
+    except (json.JSONDecodeError, RecursionError):
+        return None  # not JSON (e.g. a challenge page): the page path decides
+    page = extract_shopify_product(data, str(shopify_product_id), url, SETTINGS.max_chart_rows)
+    return _outcome_from_page(page, FetchResult(url, url, fetched.status))
 
 
 def extract_product(
@@ -380,12 +404,23 @@ def extract_product(
     http_client: httpx.Client | None = None,
     browser: BrowserFetcher | None = None,
     known_product_ids: tuple[str, ...] = (),
+    shopify_product_id: str | None = None,
 ) -> Outcome:
-    """HTTP first; the browser only for pages that were reachable but had no chart."""
+    """
+    Only charts tied to this product are accepted:
+      1. Shopify product JSON (id-checked description),
+      2. the product page, keeping only product-scoped charts,
+      3. the browser, for non-Shopify pages that had no chart at all.
+    Charts that may be store-wide come back as "generic_chart" and are not saved.
+    """
     adapter = adapter_for(url)
     client = http_client or get_http_client()
     images: list[dict[str, str]] = []
     errors: list[str] = []
+
+    shopify = extract_shopify(url, shopify_product_id, client)
+    if shopify is not None:
+        return shopify
 
     fetched = fetch_http(client, url)
     if fetched.error:
@@ -397,7 +432,7 @@ def extract_product(
         page = extract_page(
             fetched.html, fetched.final_url, requested_url=url, expected_title=expected_title,
             http_status=fetched.status, via="http", max_rows=SETTINGS.max_chart_rows,
-            known_product_ids=known_product_ids,
+            known_product_ids=known_product_ids, product_scope_only=True,
         )
         terminal = _outcome_from_page(page, fetched)
         if terminal:
@@ -416,7 +451,7 @@ def extract_product(
             page = extract_page(
                 rendered.html, rendered.final_url, requested_url=url, expected_title=expected_title,
                 http_status=rendered.status, via="browser", max_rows=SETTINGS.max_chart_rows,
-                known_product_ids=known_product_ids,
+                known_product_ids=known_product_ids, product_scope_only=True,
             )
             terminal = _outcome_from_page(page, rendered)
             if terminal:
@@ -442,6 +477,7 @@ OUTCOME_TO_RESULT = {
     "found": "found",
     "not_found": "not_found",
     "image_chart": "pending_ocr",
+    "generic_chart": "generic_chart",
     "blocked": "blocked",
     "failed": "failed",
 }
@@ -455,6 +491,7 @@ RECHECK_AFTER_SECONDS = {
     "blocked": 24 * 3600,
     "not_found": 30 * 24 * 3600,
     "pending_ocr": 30 * 24 * 3600,
+    "generic_chart": 30 * 24 * 3600,
 }
 MAX_ERROR_CHARS = 300
 
@@ -482,6 +519,7 @@ _CLAIM_PRODUCTS = """
                   WHEN 'blocked'     THEN %(blocked)s * INTERVAL '1 second'
                   WHEN 'not_found'   THEN %(not_found)s * INTERVAL '1 second'
                   WHEN 'pending_ocr' THEN %(pending_ocr)s * INTERVAL '1 second'
+                  WHEN 'generic_chart' THEN %(generic_chart)s * INTERVAL '1 second'
               END
           )
         ORDER BY k.checked_at ASC NULLS FIRST, p.id
@@ -618,7 +656,8 @@ def process_product(product: dict[str, Any]) -> str:
             outcome = Outcome("not_found", url, error="product_url is a Google URL, not a store page")
         else:
             outcome = extract_product(url, product.get("title"), get_http_client(),
-                                      get_browser(), known_product_ids=known_ids(product))
+                                      get_browser(), known_product_ids=known_ids(product),
+                                      shopify_product_id=product.get("shopify_product_id"))
     except Exception as exc:
         log.exception("extraction error product=%s", product["product_id"])
         outcome = Outcome("failed", url, error=f"{type(exc).__name__}: {exc}")
@@ -720,8 +759,10 @@ def _print_outcome(outcome: Outcome) -> None:
     print(json.dumps(out, indent=2, ensure_ascii=False))
 
 
-def cli_extract_url(url: str, title: str | None, use_browser: bool) -> None:
-    outcome = extract_product(url, title, get_http_client(), get_browser() if use_browser else None)
+def cli_extract_url(url: str, title: str | None, use_browser: bool, shopify_id: str | None = None) -> None:
+    outcome = extract_product(url, title, get_http_client(), get_browser() if use_browser else None,
+                              known_product_ids=(shopify_id,) if shopify_id else (),
+                              shopify_product_id=shopify_id)
     _print_outcome(outcome)
 
 
@@ -729,7 +770,7 @@ def cli_extract_file(path: str, url: str, title: str | None) -> None:
     with open(path, encoding="utf-8", errors="replace") as f:
         html = f.read()
     page = extract_page(html, url, requested_url=url, expected_title=title,
-                        http_status=200, max_rows=SETTINGS.max_chart_rows)
+                        http_status=200, max_rows=SETTINGS.max_chart_rows, product_scope_only=True)
     fetched = FetchResult(url, url, 200)
     outcome = _outcome_from_page(page, fetched) or Outcome(
         page.status, url, error=page.error, images=page.images)
@@ -750,7 +791,8 @@ def cli_dry_run(product_id: int, use_browser: bool) -> None:
     print(json.dumps({"product": product}, indent=2, default=str))
     outcome = extract_product(product["product_url"], product.get("title"), get_http_client(),
                               get_browser() if use_browser else None,
-                              known_product_ids=known_ids(product))
+                              known_product_ids=known_ids(product),
+                              shopify_product_id=product.get("shopify_product_id"))
     _print_outcome(outcome)
     print(json.dumps({"would_record_result": result_for(outcome),
                       "would_save_chart": outcome.status == "found"}, indent=2))
@@ -764,6 +806,7 @@ def main(argv: list[str] | None = None) -> None:
     p_url.add_argument("url")
     p_url.add_argument("--title")
     p_url.add_argument("--no-browser", action="store_true")
+    p_url.add_argument("--shopify-id", help="the product's shopify_product_id (enables the id check)")
 
     p_file = sub.add_parser("extract-file", help="extract a saved HTML file (no DB, no network)")
     p_file.add_argument("path")
@@ -776,7 +819,7 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
     if args.command == "extract-url":
-        cli_extract_url(args.url, args.title, not args.no_browser)
+        cli_extract_url(args.url, args.title, not args.no_browser, args.shopify_id)
     elif args.command == "extract-file":
         cli_extract_file(args.path, args.url, args.title)
     elif args.command == "dry-run":

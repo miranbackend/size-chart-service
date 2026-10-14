@@ -9,6 +9,7 @@ The database name must contain "test" because these tests DROP tables.
 """
 
 import gzip
+import json
 import os
 from pathlib import Path
 
@@ -35,8 +36,22 @@ SHOPIFY_PAGE = f"""<html><head><title>Linen Kurta - Store</title></head><body>
 <table><tr><th>Size</th><th>Chest (in)</th><th>Length (in)</th></tr>
 <tr><td>S</td><td>38</td><td>40</td></tr><tr><td>M</td><td>40</td><td>41</td></tr>
 <tr><td>L</td><td>42</td><td>42</td></tr></table>{LONG}</body></html>"""
+CHART_TABLE = """<table><tr><th>Size</th><th>Chest (in)</th><th>Length (in)</th></tr>
+<tr><td>S</td><td>38</td><td>40</td></tr><tr><td>M</td><td>40</td><td>41</td></tr>
+<tr><td>L</td><td>42</td><td>42</td></tr></table>"""
+DESCRIPTION_PAGE = (f"<html><head><title>Linen Kurta</title></head><body>"
+                    f"<div class='product__description'>{CHART_TABLE}</div>{LONG}</body></html>")
+# <product_url>.js responses (Shopify product JSON)
+SHOPIFY_JSON = {
+    "/products/shopify-chart.js": {"id": SHOPIFY_ID, "description": f"<p>Linen.</p>{CHART_TABLE}"},
+    "/products/shopify-nochart.js": {"id": SHOPIFY_ID, "description": "<p>Linen. Sizes S, M, L.</p>"},
+    "/products/shopify-wrong-id.js": {"id": 111, "description": CHART_TABLE},
+    "/products/shopify-image.js": {"id": SHOPIFY_ID,
+                                   "description": "<img src='/files/kurta-size-chart.jpg' alt='Size chart'>"},
+}
 PAGES = {
     "/products/kurta": (200, SHOPIFY_PAGE),
+    "/products/description-chart": (200, DESCRIPTION_PAGE),
     "/products/captcha": (200, "<html><head><title>Robot Check</title></head><body>"
                                "Enter the characters you see below</body></html>"),
     "/products/sizes-only": (200, f"<html><body><ul><li>S</li><li>M</li></ul>"
@@ -111,6 +126,9 @@ def http(monkeypatch):
             raise httpx.ConnectError("connection refused", request=request)
         if request.url.host == "www.myntra.com":
             return httpx.Response(200, text=myntra, headers={"content-type": "text/html"})
+        if request.url.path in SHOPIFY_JSON:
+            return httpx.Response(200, text=json.dumps(SHOPIFY_JSON[request.url.path]),
+                                  headers={"content-type": "application/json"})
         status, body = PAGES.get(request.url.path, (404, "not found"))
         return httpx.Response(status, text=body, headers={"content-type": "text/html"})
 
@@ -178,8 +196,8 @@ def test_save_chart_refuses_single_row(conn):
 # Processing products end to end
 # ------------------------------------------------------------------
 
-def test_shopify_product_chart_saved_with_id_evidence(conn, http):
-    add_product(conn, 10, "https://store.example.com/products/kurta")
+def test_shopify_json_description_chart_saved(conn, http):
+    add_product(conn, 10, "https://store.example.com/products/shopify-chart")
 
     assert worker.process_once() == 1
 
@@ -188,14 +206,42 @@ def test_shopify_product_chart_saved_with_id_evidence(conn, http):
                                      "M": {"chest": "40", "length": "41"},
                                      "L": {"chest": "42", "length": "42"}}
     assert row["chart"]["size_order"] == ["S", "M", "L"]
-    assert row["chart"]["evidence"]["product_id_in_page"] is True
+    assert row["chart"]["evidence"]["product_id_match"] is True
     assert (row["chart_type"], row["unit"], row["source"], row["extraction_method"]) == \
-        ("measurement_chart", "inch", "html", "html_table")
-    assert row["source_url"] == "https://store.example.com/products/kurta"
+        ("measurement_chart", "inch", "html", "shopify_description")
+    assert row["source_url"] == "https://store.example.com/products/shopify-chart"
     assert check(conn, 10) == "found"
+    # The id-checked JSON was enough; the HTML page was never fetched.
+    assert http == ["https://store.example.com/products/shopify-chart.js"]
 
     # Found products are not picked again.
     assert worker.process_once() == 0
+
+
+def test_store_wide_chart_is_not_saved(conn, http):
+    # Theme size-guide table on the page, not in the description.
+    add_product(conn, 12, "https://store.example.com/products/kurta")
+    worker.process_once()
+    assert check(conn, 12) == "generic_chart"
+    assert chart_row(conn, 12) is None
+
+
+def test_table_in_page_description_saved(conn, http):
+    add_product(conn, 13, "https://store.example.com/products/description-chart")
+    worker.process_once()
+    assert check(conn, 13) == "found"
+    assert chart_row(conn, 13)["chart"]["evidence"]["in_product_description"] is True
+
+
+def test_shopify_json_outcomes(conn, http):
+    add_product(conn, 14, "https://store.example.com/products/shopify-nochart")
+    add_product(conn, 15, "https://store.example.com/products/shopify-wrong-id")
+    add_product(conn, 16, "https://store.example.com/products/shopify-image")
+    assert worker.process_once() == 3
+    assert check(conn, 14) == "not_found"
+    assert check(conn, 15) == "not_found"       # JSON id != shopify_product_id
+    assert check(conn, 16) == "pending_ocr"     # chart image in the description
+    assert conn.execute("SELECT count(*) AS n FROM product_size_charts").fetchone()["n"] == 0
 
 
 def test_myntra_fixture_saved_into_product_size_charts(conn, http):
@@ -225,7 +271,7 @@ def test_check_results_for_each_outcome(conn, http):
 
     assert check(conn, 21) == "blocked"
     assert check(conn, 22) == "not_found"
-    assert check(conn, 23) == "pending_ocr"
+    assert check(conn, 23) == "generic_chart"  # image not in the description
     assert check(conn, 24) == "failed"
     assert check(conn, 25) == "not_found"      # 404
     assert check(conn, 26) is None

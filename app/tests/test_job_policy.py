@@ -7,6 +7,7 @@ from worker import Outcome, database_url, result_for
     ("found", "found"),
     ("not_found", "not_found"),
     ("image_chart", "pending_ocr"),   # image found, never stored as a chart
+    ("generic_chart", "generic_chart"),  # chart not tied to the product: not saved
     ("blocked", "blocked"),
     ("failed", "failed"),
     ("something_else", "failed"),
