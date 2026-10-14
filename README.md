@@ -49,7 +49,8 @@ same product. Unchecked products come first.
 | `found` | chart saved to `product_size_charts` | never (automatically) |
 | `not_found` | no product-specific measurement chart, or the page is a different product | 30 days |
 | `generic_chart` | a chart exists but isn't tied to this product (store-wide/category guide): not saved | 30 days |
-| `pending_ocr` | a size-chart image in the product's own description (nothing saved; needs OCR) | 30 days |
+| `pending_ocr` | a size-chart image in the product's own description, OCR off (no `GEMINI_API_KEY`) | 30 days |
+| `ocr_review` | the two Gemini reads of the image disagreed (or it held several charts): not saved | 30 days |
 | `blocked` | CAPTCHA / anti-bot / HTTP 403 / 429 | 24 hours |
 | `failed` | network or unexpected error | 6 hours |
 | `processing` | being worked on now; older than 30 min means a worker died | 30 minutes |
@@ -75,8 +76,23 @@ A chart is saved only from a source tied to this one product:
 
 Every chart is also validated: at least 2 sizes, each with at least one
 recognised measurement field (chest, waist, hip, length, sleeve, inseam, …) and a numeric value.
-Stock, price and size-conversion columns never count. Size-chart images are
-never saved; one inside the description is recorded as `pending_ocr`.
+Stock, price and size-conversion columns never count.
+
+### Size-chart images (OCR with Gemini)
+
+A size-chart image in the product's own description is read with Gemini when
+`GEMINI_API_KEY` is set (`ocr.py`). It is saved only if:
+
+- Gemini reports it is a measurement chart, and only one chart is in the image;
+- the image is read **twice** with differently worded instructions and both reads give the same sizes, values and unit;
+- the chart passes the same validation as tables;
+- at least 2 of its sizes are among the product's own `products.sizes`.
+
+Such charts are saved with `source = 'image'`, `extraction_method = 'image_ocr'`,
+confidence 0.70, and the image URL in `chart.evidence.image_url`. Reads that
+disagree become `ocr_review`; a chart for other sizes is `not_found`; a Gemini
+error is `failed` (retried after 6 hours). Images on the page outside the
+description are never read (`generic_chart`).
 CAPTCHAs and bot protection are recorded as `blocked`, never bypassed.
 
 ## Settings
@@ -96,6 +112,11 @@ CAPTCHAs and bot protection are recorded as `blocked`, never bypassed.
 | `BROWSER_RESTART_EVERY` | `50` | restart Chromium after N pages |
 | `MAX_CHART_ROWS` | `100` | larger "charts" are rejected |
 | `MAX_HTML_BYTES` | `8000000` | max page download |
+| `GEMINI_API_KEY` | empty | enables OCR of size-chart images; keep it secret (runtime only) |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | Gemini model used for OCR |
+| `OCR_ENABLED` | `true` | `false` turns OCR off even with a key |
+| `OCR_MAX_IMAGES` | `2` | images read per product (each read twice) |
+| `OCR_TIMEOUT_SECONDS` | `60` | per Gemini request |
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `text` | `LOG_FORMAT=json` for JSON lines |
 
 If `WORKER_MODE` is unset, `WORKER_ENABLED=true` still means mode `1`.

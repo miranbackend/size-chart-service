@@ -36,6 +36,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from ocr import read_chart_image
 from extraction import (
     Chart,
     PageResult,
@@ -94,6 +95,12 @@ class Settings:
     max_html_bytes: int = field(default_factory=lambda: _env_int("MAX_HTML_BYTES", 8_000_000))
     browser_enabled: bool = field(default_factory=lambda: _env_bool("BROWSER_ENABLED", True))
     browser_restart_every: int = field(default_factory=lambda: _env_int("BROWSER_RESTART_EVERY", 50))
+    # Size-chart images in the product description are read with Gemini when a key is set.
+    gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", "").strip(), repr=False)
+    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip())
+    ocr_enabled: bool = field(default_factory=lambda: _env_bool("OCR_ENABLED", True))
+    ocr_max_images: int = field(default_factory=lambda: _env_int("OCR_MAX_IMAGES", 2))
+    ocr_timeout_seconds: int = field(default_factory=lambda: _env_int("OCR_TIMEOUT_SECONDS", 60))
 
 
 SETTINGS = Settings()
@@ -478,6 +485,7 @@ OUTCOME_TO_RESULT = {
     "not_found": "not_found",
     "image_chart": "pending_ocr",
     "generic_chart": "generic_chart",
+    "ocr_review": "ocr_review",
     "blocked": "blocked",
     "failed": "failed",
 }
@@ -492,6 +500,7 @@ RECHECK_AFTER_SECONDS = {
     "not_found": 30 * 24 * 3600,
     "pending_ocr": 30 * 24 * 3600,
     "generic_chart": 30 * 24 * 3600,
+    "ocr_review": 30 * 24 * 3600,
 }
 MAX_ERROR_CHARS = 300
 
@@ -520,6 +529,7 @@ _CLAIM_PRODUCTS = """
                   WHEN 'not_found'   THEN %(not_found)s * INTERVAL '1 second'
                   WHEN 'pending_ocr' THEN %(pending_ocr)s * INTERVAL '1 second'
                   WHEN 'generic_chart' THEN %(generic_chart)s * INTERVAL '1 second'
+                  WHEN 'ocr_review'  THEN %(ocr_review)s * INTERVAL '1 second'
               END
           )
         ORDER BY k.checked_at ASC NULLS FIRST, p.id
@@ -533,7 +543,7 @@ _CLAIM_PRODUCTS = """
             SET result = EXCLUDED.result, checked_at = EXCLUDED.checked_at
         RETURNING product_id
     )
-    SELECT p.id AS product_id, p.product_url, p.title, p.shopify_product_id
+    SELECT p.id AS product_id, p.product_url, p.title, p.shopify_product_id, p.sizes
     FROM claimed c
     JOIN products p ON p.id = c.product_id
     ORDER BY p.id
@@ -594,6 +604,7 @@ def save_chart(conn, product_id: int, chart: Chart, source_url: str) -> int:
             Jsonb(chart_document(chart)),
             chart.chart_type,
             chart.unit or "unknown",  # unit is NOT NULL
+            "image" if chart.source == "image" else
             "browser" if chart.method.startswith("browser_") else "html",
             source_url,
             chart.method,
@@ -643,6 +654,36 @@ def release_products(products: list[dict[str, Any]]) -> None:
 # PROCESSING
 # ============================================================
 
+def ocr_enabled() -> bool:
+    return SETTINGS.ocr_enabled and bool(SETTINGS.gemini_api_key)
+
+
+def apply_ocr(outcome: Outcome, product: dict[str, Any]) -> Outcome:
+    """
+    Read the product's own size-chart images. Saved only when both reads
+    agree and the sizes match the product's sizes; see ocr.read_chart_image.
+    """
+    statuses, errors = [], []
+    for image in outcome.images[: max(1, SETTINGS.ocr_max_images)]:
+        result = read_chart_image(
+            get_http_client(), image["url"],
+            api_key=SETTINGS.gemini_api_key, model=SETTINGS.gemini_model,
+            product_sizes=product.get("sizes"), timeout=SETTINGS.ocr_timeout_seconds,
+            max_rows=SETTINGS.max_chart_rows,
+        )
+        if result.status == "found":
+            return Outcome("found", outcome.source_url, chart=result.chart, http_status=outcome.http_status)
+        statuses.append(result.status)
+        errors.append(f"{result.status}: {result.error}")
+
+    error = "; ".join(errors)[:MAX_ERROR_CHARS]
+    if "error" in statuses:
+        return Outcome("failed", outcome.source_url, error=f"ocr: {error}", images=outcome.images)
+    if "disagree" in statuses or "ambiguous" in statuses:
+        return Outcome("ocr_review", outcome.source_url, error=f"ocr: {error}", images=outcome.images)
+    return Outcome("not_found", outcome.source_url, error=f"ocr: {error}", images=outcome.images)
+
+
 def known_ids(product: dict[str, Any]) -> tuple[str, ...]:
     sid = product.get("shopify_product_id")
     return (str(sid),) if sid else ()
@@ -658,6 +699,8 @@ def process_product(product: dict[str, Any]) -> str:
             outcome = extract_product(url, product.get("title"), get_http_client(),
                                       get_browser(), known_product_ids=known_ids(product),
                                       shopify_product_id=product.get("shopify_product_id"))
+        if outcome.status == "image_chart" and ocr_enabled():
+            outcome = apply_ocr(outcome, product)
     except Exception as exc:
         log.exception("extraction error product=%s", product["product_id"])
         outcome = Outcome("failed", url, error=f"{type(exc).__name__}: {exc}")
@@ -725,7 +768,8 @@ def run_worker() -> None:
         return
 
     log_event("worker_started", worker=SETTINGS.worker_id, batch=SETTINGS.batch_size,
-              browser=SETTINGS.browser_enabled)
+              browser=SETTINGS.browser_enabled,
+              ocr=f"gemini:{SETTINGS.gemini_model}" if ocr_enabled() else "off")
     try:
         while not _stop.is_set():
             try:
@@ -781,7 +825,7 @@ def cli_dry_run(product_id: int, use_browser: bool) -> None:
     """Extract one product from the `products` table without writing anything."""
     with get_pool().connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
-            "SELECT id AS product_id, product_url, title, shopify_product_id, is_active "
+            "SELECT id AS product_id, product_url, title, shopify_product_id, sizes, is_active "
             "FROM products WHERE id = %s",
             (product_id,),
         )
@@ -793,6 +837,8 @@ def cli_dry_run(product_id: int, use_browser: bool) -> None:
                               get_browser() if use_browser else None,
                               known_product_ids=known_ids(product),
                               shopify_product_id=product.get("shopify_product_id"))
+    if outcome.status == "image_chart" and ocr_enabled():
+        outcome = apply_ocr(outcome, product)
     _print_outcome(outcome)
     print(json.dumps({"would_record_result": result_for(outcome),
                       "would_save_chart": outcome.status == "found"}, indent=2))

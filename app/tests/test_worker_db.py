@@ -49,6 +49,12 @@ SHOPIFY_JSON = {
     "/products/shopify-image.js": {"id": SHOPIFY_ID,
                                    "description": "<img src='/files/kurta-size-chart.jpg' alt='Size chart'>"},
 }
+OCR_READING = {
+    "is_measurement_chart": True, "chart_count": 1, "unit": "cm", "measurement_basis": "garment",
+    "rows": [{"size": s, "measurements": [{"name": "Chest", "value": c}, {"name": "Length", "value": l}]}
+             for s, c, l in (("S", "96", "102"), ("M", "101", "104"), ("L", "106", "106"))],
+}
+GEMINI_READINGS: list = []
 PAGES = {
     "/products/kurta": (200, SHOPIFY_PAGE),
     "/products/description-chart": (200, DESCRIPTION_PAGE),
@@ -71,6 +77,7 @@ CREATE TABLE products (
     handle VARCHAR NOT NULL DEFAULT 'h',
     title VARCHAR NOT NULL,
     product_url VARCHAR NOT NULL,
+    sizes VARCHAR[] NOT NULL DEFAULT '{}',
     is_active BOOLEAN NOT NULL DEFAULT TRUE
 );
 CREATE TABLE product_size_charts (
@@ -126,6 +133,12 @@ def http(monkeypatch):
             raise httpx.ConnectError("connection refused", request=request)
         if request.url.host == "www.myntra.com":
             return httpx.Response(200, text=myntra, headers={"content-type": "text/html"})
+        if request.url.host == "generativelanguage.googleapis.com":
+            reading = GEMINI_READINGS.pop(0)
+            return httpx.Response(200, json={"status": "completed", "steps": [
+                {"type": "model_output", "content": [{"type": "text", "text": json.dumps(reading)}]}]})
+        if request.url.path == "/files/kurta-size-chart.jpg":
+            return httpx.Response(200, content=b"jpeg", headers={"content-type": "image/jpeg"})
         if request.url.path in SHOPIFY_JSON:
             return httpx.Response(200, text=json.dumps(SHOPIFY_JSON[request.url.path]),
                                   headers={"content-type": "application/json"})
@@ -136,15 +149,17 @@ def http(monkeypatch):
     monkeypatch.setattr(worker, "_http_client", client)
     monkeypatch.setattr(worker.SETTINGS, "browser_enabled", False)
     monkeypatch.setattr(worker.SETTINGS, "batch_size", 20)
+    monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "")
     yield calls
     client.close()
 
 
-def add_product(conn, pid, url, title="Linen Kurta", shopify_id=SHOPIFY_ID, active=True):
+def add_product(conn, pid, url, title="Linen Kurta", shopify_id=SHOPIFY_ID, active=True,
+                sizes=("S", "M", "L", "XL")):
     conn.execute(
-        "INSERT INTO products (id, shopify_product_id, title, product_url, is_active) "
-        "VALUES (%s, %s, %s, %s, %s)",
-        (pid, shopify_id, title, url, active),
+        "INSERT INTO products (id, shopify_product_id, title, product_url, is_active, sizes) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (pid, shopify_id, title, url, active, list(sizes)),
     )
 
 
@@ -324,3 +339,52 @@ def test_claim_never_hands_the_same_product_to_two_workers(conn, http):
     second = {p["product_id"] for p in worker.claim_products(4)}
     assert len(first) == len(second) == 4
     assert not first & second
+
+
+# ------------------------------------------------------------------
+# Size-chart images read with Gemini (OCR)
+# ------------------------------------------------------------------
+
+def test_description_image_read_with_ocr_and_saved(conn, http, monkeypatch):
+    monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "test-key")
+    GEMINI_READINGS[:] = [OCR_READING, OCR_READING]        # both reads agree
+    add_product(conn, 70, "https://store.example.com/products/shopify-image")
+
+    worker.process_once()
+
+    row = chart_row(conn, 70)
+    assert row["chart"]["sizes"] == {"S": {"chest": "96", "length": "102"},
+                                     "M": {"chest": "101", "length": "104"},
+                                     "L": {"chest": "106", "length": "106"}}
+    assert (row["unit"], row["source"], row["extraction_method"]) == ("cm", "image", "image_ocr")
+    assert row["chart"]["evidence"]["image_url"].endswith("/files/kurta-size-chart.jpg")
+    assert check(conn, 70) == "found"
+
+
+def test_ocr_reads_that_differ_go_to_review(conn, http, monkeypatch):
+    monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "test-key")
+    other = json.loads(json.dumps(OCR_READING))
+    other["rows"][0]["measurements"][0]["value"] = "86"
+    GEMINI_READINGS[:] = [OCR_READING, other]
+    add_product(conn, 71, "https://store.example.com/products/shopify-image")
+
+    worker.process_once()
+    assert check(conn, 71) == "ocr_review"
+    assert chart_row(conn, 71) is None
+
+
+def test_ocr_chart_for_other_sizes_not_saved(conn, http, monkeypatch):
+    monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "test-key")
+    GEMINI_READINGS[:] = [OCR_READING, OCR_READING]
+    add_product(conn, 72, "https://store.example.com/products/shopify-image", sizes=("28", "30", "32"))
+
+    worker.process_once()
+    assert check(conn, 72) == "not_found"
+    assert chart_row(conn, 72) is None
+
+
+def test_without_key_image_stays_pending_ocr(conn, http):
+    add_product(conn, 73, "https://store.example.com/products/shopify-image")
+    worker.process_once()
+    assert check(conn, 73) == "pending_ocr"
+    assert not any("googleapis" in u for u in http)
