@@ -1,12 +1,16 @@
 # Size-chart worker
 
-Finds the measurement chart (chest, waist, length, …) that belongs to each
-active product in `products` and saves it to `product_size_charts`.
+Finds the size chart each active product in `products` shows to shoppers and
+saves it to `product_size_charts`, labelled with where it came from:
 
-Only a chart that provably belongs to that product is saved. Store-wide or
-category size guides (theme popups, size-chart apps, the same table on every
-page) are recorded as `generic_chart` and not saved. Available/purchasable
-sizes are never treated as a chart.
+| `chart.chart_scope` | Meaning |
+|---|---|
+| `product` | the product's own chart (its Shopify description, or product data tied to its id) |
+| `collection` | the Kiwi Sizing app chart the store assigned to this product's collection/tag/vendor |
+| `store` | the store's general size guide shown on the product page (theme table or image) |
+
+Your app can filter on `chart->>'chart_scope'` if it needs product-only charts.
+Available/purchasable sizes are never treated as a chart.
 
 ## Tables
 
@@ -46,10 +50,9 @@ same product. Unchecked products come first.
 
 | `result` | Meaning | Checked again after |
 |---|---|---|
-| `found` | chart saved to `product_size_charts` | never (automatically) |
-| `not_found` | no product-specific measurement chart, or the page is a different product | 30 days |
-| `generic_chart` | a chart exists but isn't tied to this product (store-wide/category guide): not saved | 30 days |
-| `pending_ocr` | a size-chart image in the product's own description, OCR off (no `GEMINI_API_KEY`) | 30 days |
+| `found` | chart saved to `product_size_charts` (see `chart_scope`) | never (automatically) |
+| `not_found` | no size chart on the product page, product removed (404), or a different product | 30 days |
+| `pending_ocr` | only a size-chart image was found and OCR is off (no `GEMINI_API_KEY`) | 30 days |
 | `ocr_review` | the two Gemini reads of the image disagreed (or it held several charts): not saved | 30 days |
 | `blocked` | CAPTCHA / anti-bot / HTTP 403 / 429 | 24 hours |
 | `failed` | network or unexpected error | 6 hours |
@@ -61,38 +64,41 @@ its row from `product_size_chart_checks`.
 
 ## Extraction
 
-A chart is saved only from a source tied to this one product:
+Sources, best first (the first that yields a valid chart wins):
 
-1. **Shopify product JSON** (`<product_url>.js`). Its `id` must equal
-   `products.shopify_product_id`. A measurement table in its `description` (the
-   merchant's per-product description) is that product's chart. When this JSON is
-   available the page isn't fetched. A wrong `id` gives `not_found` (product mismatch).
-2. **The product page** (stores without that JSON), keeping only:
-   - retailer data tied to the product id (e.g. Myntra `window.__myx.pdpData.sizes[].measurements`, id must match the URL),
-   - embedded JSON found under the product's own id,
-   - a `<table>` inside the product's description block (`itemprop="description"` or a description class/id).
-   Any other chart on the page is `generic_chart`.
-3. **Headless Chromium**, only for non-Shopify pages that loaded with no chart at all (it clicks a size-guide control once). The same rules apply.
+1. **Shopify product JSON** (`<product_url>.js`): `id` must equal `products.shopify_product_id`;
+   a measurement table in the product's `description` → scope `product`. A wrong id → `not_found`.
+2. **Product page**: retailer data tied to the product id (e.g. Myntra), embedded JSON under the
+   product's id, or a table in the description block → scope `product`.
+3. **Kiwi Sizing app**: if the page has the Kiwi widget, the worker makes the same request the widget
+   makes (`app.kiwisizing.com/api/getSizingChart` with the page's product id, collections, tags,
+   vendor) and parses Kiwi's table. Scope from Kiwi's own matching rule: `product` when matched to
+   this product id, otherwise `collection`.
+4. **Other tables on the page** (theme size guide) → scope `store`.
+5. **Headless Chromium**, for pages that loaded with no chart and no chart image.
+6. **Size-chart images** → OCR (below). Description images are tried before store-wide images.
 
-Every chart is also validated: at least 2 sizes, each with at least one
-recognised measurement field (chest, waist, hip, length, sleeve, inseam, …) and a numeric value.
+Every chart is validated: at least 2 sizes, each with at least one recognised measurement field
+(chest, waist, hip, length, sleeve, inseam, …) and a numeric value.
 Stock, price and size-conversion columns never count.
 
 ### Size-chart images (OCR with Gemini)
 
-A size-chart image in the product's own description is read with Gemini when
-`GEMINI_API_KEY` is set (`ocr.py`). It is saved only if:
+Size-chart images (in the description or the store's size guide) are read with
+Gemini when `GEMINI_API_KEY` is set (`ocr.py`). Each image URL is read once per
+worker process and cached, because store-wide images repeat on every product.
+A chart is saved only if:
 
 - Gemini reports it is a measurement chart, and only one chart is in the image;
 - the image is read **twice** with differently worded instructions and both reads give the same sizes, values and unit;
 - the chart passes the same validation as tables;
-- at least 2 of its sizes are among the product's own `products.sizes`.
+- at least 2 of its sizes are among the product's own `products.sizes`;
+- exactly one distinct chart matches the product (several different matching images → `ocr_review`).
 
 Such charts are saved with `source = 'image'`, `extraction_method = 'image_ocr'`,
 confidence 0.70, and the image URL in `chart.evidence.image_url`. Reads that
 disagree become `ocr_review`; a chart for other sizes is `not_found`; a Gemini
-error is `failed` (retried after 6 hours). Images on the page outside the
-description are never read (`generic_chart`).
+error is `failed` (retried after 6 hours).
 CAPTCHAs and bot protection are recorded as `blocked`, never bypassed.
 
 ## Settings
@@ -115,7 +121,7 @@ CAPTCHAs and bot protection are recorded as `blocked`, never bypassed.
 | `GEMINI_API_KEY` | empty | enables OCR of size-chart images; keep it secret (runtime only) |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Gemini model used for OCR |
 | `OCR_ENABLED` | `true` | `false` turns OCR off even with a key |
-| `OCR_MAX_IMAGES` | `2` | images read per product (each read twice) |
+| `OCR_MAX_IMAGES` | `3` | images considered per product (each image read twice, once per worker) |
 | `OCR_TIMEOUT_SECONDS` | `60` | per Gemini request |
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `text` | `LOG_FORMAT=json` for JSON lines |
 

@@ -1491,6 +1491,7 @@ def _found(
     strong_id: bool,
 ) -> PageResult:
     evidence = {**evidence, **cand.evidence}
+    evidence.setdefault("chart_scope", "product" if is_product_scoped(cand) else "store")
     # Without an id tie, a page whose title does not look like the catalogue
     # product is not trusted: its chart may belong to something else.
     if not strong_id and overlap is not None and overlap < 0.3:
@@ -1576,3 +1577,115 @@ def extract_shopify_product(
                           error="size chart image in product description; OCR not implemented")
     return PageResult(status="not_found", evidence=evidence, authoritative=True,
                       error="shopify: no measurement table in product description")
+
+
+# ============================================================
+# KIWI SIZING APP (size chart the store assigns to the product)
+# ============================================================
+
+KIWI_API = "https://app.kiwisizing.com/api/getSizingChart"
+_KIWI_SHOP_RE = re.compile(r'KiwiSizing\.shop\s*=\s*"([^"]+)"')
+_KIWI_FIELD_RE = re.compile(r'(\w+)\s*:\s*"((?:[^"\\]|\\.)*)"')
+_KIWI_FIELDS = ("collections", "tags", "product", "vendor", "type", "title")
+SCOPE_RANK = {"product": 0, "collection": 1, "store": 2}
+
+
+def kiwi_request_params(html: str) -> dict[str, str] | None:
+    """
+    The product data the Kiwi widget sends to Kiwi (shop, product id,
+    collections, tags, vendor, type), read from the page's KiwiSizing script.
+    """
+    shop = _KIWI_SHOP_RE.search(html or "")
+    if not shop:
+        return None
+    start = html.find("KiwiSizing.data", shop.start())
+    brace = html.find("{", start) if start >= 0 else -1
+    end = html.find("};", brace) if brace >= 0 else -1
+    if end < 0 or end - brace > 50_000:
+        return None
+    fields = {}
+    for key, raw in _KIWI_FIELD_RE.findall(html[brace:end]):
+        if key in _KIWI_FIELDS and key not in fields:
+            try:
+                fields[key] = json.loads(f'"{raw}"')
+            except json.JSONDecodeError:
+                fields[key] = raw
+    if not fields.get("product"):
+        return None
+    return {"shop": shop.group(1), **fields}
+
+
+def _kiwi_cell(cell: Any) -> str:
+    if not isinstance(cell, dict):
+        return clean_text(cell)
+    value = cell.get("value")
+    if value in (None, ""):
+        lo = cell.get("min", cell.get("from"))
+        hi = cell.get("max", cell.get("to"))
+        value = f"{lo}-{hi}" if lo not in (None, "") and hi not in (None, "") else (lo or hi)
+    return clean_text(value)
+
+
+def _kiwi_scope(sizing: dict, product_id: str) -> tuple[str, list]:
+    matchings = [m for m in sizing.get("productMatchings") or []
+                 if isinstance(m, dict) and not m.get("isNegative")]
+    summary = [(m.get("type"), str(m.get("value"))) for m in matchings]
+    if any(m.get("type") == "product" and str(m.get("value")) == str(product_id) for m in matchings):
+        return "product", summary
+    return ("collection" if matchings else "store"), summary
+
+
+def kiwi_candidates(
+    response: Any,
+    product_id: str,
+    max_rows: int = DEFAULT_MAX_CHART_ROWS,
+) -> list[Candidate]:
+    """Measurement charts from a Kiwi getSizingChart response, best scope first."""
+    found: list[Candidate] = []
+    sizings = response.get("sizings") if isinstance(response, dict) else None
+    for sizing in sizings or []:
+        if not isinstance(sizing, dict) or sizing.get("isEnabled") is False:
+            continue
+        scope, matchings = _kiwi_scope(sizing, product_id)
+        tables = sizing.get("tables") or {}
+        layout = (sizing.get("layout") or {}).get("data") or []
+        order = [item.get("value") for item in layout if isinstance(item, dict) and item.get("type") == 1]
+        for table_id in order or list(tables):
+            table = tables.get(table_id)
+            if not isinstance(table, dict) or table.get("hide"):
+                continue
+            rows = [row for row in table.get("data") or [] if isinstance(row, list)]
+            matrix = [[_kiwi_cell(cell) for cell in row] for row in rows]
+            cell_units = [normalize_unit(cell.get("unitType")) for row in rows for cell in row
+                          if isinstance(cell, dict)]
+            cell_units = [u for u in cell_units if u]
+            parsed = rows_to_sizes(matrix, " ".join(cell_units))
+            if not parsed:
+                continue
+            sizes, unit, raw = parsed
+            clean, _reason = validate_chart(sizes, max_rows)
+            if not clean:
+                continue
+            if cell_units:
+                unit = max(set(cell_units), key=cell_units.count)
+            found.append(Candidate(
+                sizes=clean,
+                unit=unit,
+                method="kiwi_app",
+                confidence=0.85 if scope == "product" else 0.80,
+                evidence={"chart_scope": scope, "kiwi_sizing_id": sizing.get("id"),
+                          "kiwi_name": sizing.get("name"), "kiwi_matchings": matchings[:20]},
+                raw=raw,
+            ))
+    found.sort(key=lambda c: SCOPE_RANK.get(c.evidence["chart_scope"], 3))
+    return found
+
+
+def kiwi_page_result(response: Any, product_id: str, url: str,
+                     max_rows: int = DEFAULT_MAX_CHART_ROWS) -> PageResult:
+    candidates = kiwi_candidates(response, product_id, max_rows)
+    if not candidates:
+        return PageResult(status="not_found", error="kiwi: no measurement chart for this product")
+    best = candidates[0]
+    evidence = {"site": "kiwi", "kiwi_charts": len(candidates)}
+    return _found(best, "kiwi", "", evidence, None, strong_id=True)

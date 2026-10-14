@@ -45,6 +45,9 @@ from extraction import (
     clean_text,
     extract_page,
     extract_shopify_product,
+    KIWI_API,
+    kiwi_page_result,
+    kiwi_request_params,
     is_google_url,
     shopify_json_url,
 )
@@ -99,7 +102,7 @@ class Settings:
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", "").strip(), repr=False)
     gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip())
     ocr_enabled: bool = field(default_factory=lambda: _env_bool("OCR_ENABLED", True))
-    ocr_max_images: int = field(default_factory=lambda: _env_int("OCR_MAX_IMAGES", 2))
+    ocr_max_images: int = field(default_factory=lambda: _env_int("OCR_MAX_IMAGES", 3))
     ocr_timeout_seconds: int = field(default_factory=lambda: _env_int("OCR_TIMEOUT_SECONDS", 60))
 
 
@@ -385,11 +388,10 @@ def _outcome_from_page(page: PageResult, fetched: FetchResult) -> Outcome | None
     return None
 
 
-def extract_shopify(url: str, shopify_product_id: str | None, client: httpx.Client) -> Outcome | None:
+def extract_shopify(url: str, shopify_product_id: str | None, client: httpx.Client) -> PageResult | None:
     """
-    Chart from the product's own description in <product_url>.js, after
-    checking the JSON id equals shopify_product_id. Returns None when the
-    store does not serve that JSON, so the product page is used instead.
+    The product's own description from <product_url>.js, after checking the
+    JSON id equals shopify_product_id. None when the store doesn't serve it.
     """
     js_url = shopify_json_url(url)
     if not js_url or not shopify_product_id:
@@ -401,8 +403,35 @@ def extract_shopify(url: str, shopify_product_id: str | None, client: httpx.Clie
         data = json.loads(fetched.html)
     except (json.JSONDecodeError, RecursionError):
         return None  # not JSON (e.g. a challenge page): the page path decides
-    page = extract_shopify_product(data, str(shopify_product_id), url, SETTINGS.max_chart_rows)
-    return _outcome_from_page(page, FetchResult(url, url, fetched.status))
+    return extract_shopify_product(data, str(shopify_product_id), url, SETTINGS.max_chart_rows)
+
+
+def extract_kiwi(html: str, product_ids: tuple[str, ...], client: httpx.Client) -> PageResult | None:
+    """
+    The chart the Kiwi Sizing app assigns to this product. Uses the same
+    request the store's own Kiwi widget makes from the product page.
+    """
+    params = kiwi_request_params(html)
+    if not params:
+        return None
+    if product_ids and params["product"] not in product_ids:
+        return PageResult(status="not_found",
+                          error=f"kiwi: page product {params['product']} != {product_ids[0]}")
+    try:
+        response = client.get(KIWI_API, params=params, timeout=SETTINGS.http_timeout_seconds)
+    except httpx.HTTPError as exc:
+        return PageResult(status="failed", error=f"kiwi: {type(exc).__name__}")
+    if response.status_code != 200:
+        return PageResult(status="failed", error=f"kiwi: HTTP {response.status_code}")
+    try:
+        data = response.json()
+    except ValueError:
+        return PageResult(status="failed", error="kiwi: invalid JSON")
+    return kiwi_page_result(data, params["product"], SETTINGS.max_chart_rows)
+
+
+def _scope(page: PageResult) -> str:
+    return (page.chart.evidence.get("chart_scope") if page.chart else None) or "store"
 
 
 def extract_product(
@@ -414,11 +443,14 @@ def extract_product(
     shopify_product_id: str | None = None,
 ) -> Outcome:
     """
-    Only charts tied to this product are accepted:
-      1. Shopify product JSON (id-checked description),
-      2. the product page, keeping only product-scoped charts,
-      3. the browser, for non-Shopify pages that had no chart at all.
-    Charts that may be store-wide come back as "generic_chart" and are not saved.
+    The size chart the store shows for this product, best source first:
+      1. the product's own Shopify description (id-checked)        scope product
+      2. a chart in the page's product description / product data  scope product
+      3. the Kiwi Sizing app's chart for this product               scope product/collection/store
+      4. any other chart on the page (theme size guide)             scope store
+      5. browser render, for charts drawn by JavaScript
+      6. size-chart images -> image_chart (OCR happens in apply_ocr)
+    Every saved chart carries evidence.chart_scope.
     """
     adapter = adapter_for(url)
     client = http_client or get_http_client()
@@ -427,28 +459,54 @@ def extract_product(
 
     shopify = extract_shopify(url, shopify_product_id, client)
     if shopify is not None:
-        return shopify
+        if shopify.status == "found":
+            return Outcome("found", url, chart=shopify.chart, http_status=200)
+        if shopify.status == "product_mismatch":
+            return Outcome("not_found", url, error=f"product_mismatch: {shopify.error}", http_status=200)
+        images.extend(shopify.images)  # images in the product's own description first
 
     fetched = fetch_http(client, url)
+    store_chart: Outcome | None = None
     if fetched.error:
         errors.append(f"http: {fetched.error}")
-    else:
-        if fetched.status in (404, 410):
+    elif fetched.status in (404, 410):
+        if not images:
             return Outcome("not_found", fetched.final_url, http_status=fetched.status,
                            error=f"product page returned HTTP {fetched.status}")
+        # The page is gone but the id-checked description had a chart image.
+        return Outcome("image_chart", url, images=images, http_status=fetched.status,
+                       error="size chart image found; OCR not available")
+    else:
         page = extract_page(
             fetched.html, fetched.final_url, requested_url=url, expected_title=expected_title,
             http_status=fetched.status, via="http", max_rows=SETTINGS.max_chart_rows,
-            known_product_ids=known_product_ids, product_scope_only=True,
+            known_product_ids=known_product_ids,
         )
-        terminal = _outcome_from_page(page, fetched)
-        if terminal:
-            return terminal
-        images.extend(page.images)
+        if page.status == "blocked":
+            return Outcome("blocked", fetched.final_url, error=page.error, http_status=fetched.status)
+        if page.status == "product_mismatch":
+            return Outcome("not_found", fetched.final_url, error=f"product_mismatch: {page.error}",
+                           http_status=fetched.status)
+        if page.status == "found" and _scope(page) == "product":
+            return Outcome("found", fetched.final_url, chart=page.chart, http_status=fetched.status)
+        if page.status == "found":
+            store_chart = Outcome("found", fetched.final_url, chart=page.chart, http_status=fetched.status)
+
+        kiwi = extract_kiwi(fetched.html, known_product_ids, client)
+        if kiwi is not None and kiwi.status == "found":
+            return Outcome("found", fetched.final_url, chart=kiwi.chart, http_status=fetched.status)
+        if kiwi is not None and kiwi.error:
+            errors.append(kiwi.error)
+
+        if store_chart:
+            return store_chart
+        if page.authoritative and page.status == "not_found":
+            return Outcome("not_found", fetched.final_url, error=page.error, http_status=fetched.status)
+        images.extend(i for i in page.images if i not in images)
         if fetched.status and fetched.status >= 400:
             errors.append(f"http: status {fetched.status}")
 
-    if browser is not None and adapter.use_browser:
+    if browser is not None and adapter.use_browser and not images:
         try:
             rendered = browser.fetch(url, adapter)
         except Exception as exc:  # Playwright raises many error types; all mean "no render"
@@ -458,7 +516,7 @@ def extract_product(
             page = extract_page(
                 rendered.html, rendered.final_url, requested_url=url, expected_title=expected_title,
                 http_status=rendered.status, via="browser", max_rows=SETTINGS.max_chart_rows,
-                known_product_ids=known_product_ids, product_scope_only=True,
+                known_product_ids=known_product_ids,
             )
             terminal = _outcome_from_page(page, rendered)
             if terminal:
@@ -466,11 +524,11 @@ def extract_product(
             images.extend(i for i in page.images if i not in images)
 
     if images:
-        return Outcome("image_chart", url, images=images[:5],
-                       error="size chart image found; OCR not implemented")
+        return Outcome("image_chart", url, images=images,
+                       error="size chart image found; OCR not available")
     if errors and (fetched.error or (fetched.status or 0) >= 500):
         return Outcome("failed", url, error="; ".join(errors), http_status=fetched.status)
-    return Outcome("not_found", url, error="; ".join(errors) or "no product-specific measurement chart",
+    return Outcome("not_found", url, error="; ".join(errors) or "no size chart on the product page",
                    http_status=fetched.status)
 
 
@@ -583,6 +641,7 @@ def chart_document(chart: Chart) -> dict[str, Any]:
     order, so the size order is stored explicitly.
     """
     return {
+        "chart_scope": chart.evidence.get("chart_scope", "store"),
         "sizes": chart.sizes,
         "size_order": list(chart.sizes),
         "unit": chart.unit,
@@ -605,6 +664,7 @@ def save_chart(conn, product_id: int, chart: Chart, source_url: str) -> int:
             chart.chart_type,
             chart.unit or "unknown",  # unit is NOT NULL
             "image" if chart.source == "image" else
+            "kiwi" if chart.method == "kiwi_app" else
             "browser" if chart.method.startswith("browser_") else "html",
             source_url,
             chart.method,
@@ -660,21 +720,37 @@ def ocr_enabled() -> bool:
 
 def apply_ocr(outcome: Outcome, product: dict[str, Any]) -> Outcome:
     """
-    Read the product's own size-chart images. Saved only when both reads
-    agree and the sizes match the product's sizes; see ocr.read_chart_image.
+    Read the size-chart images (each image is read once per worker and
+    cached, since store-wide images repeat on every product). A chart is
+    saved only if exactly one distinct chart matches the product's sizes.
     """
-    statuses, errors = [], []
+    found, statuses, errors = [], [], []
     for image in outcome.images[: max(1, SETTINGS.ocr_max_images)]:
+        scope = "product" if image.get("in_product_description") else "store"
         result = read_chart_image(
             get_http_client(), image["url"],
             api_key=SETTINGS.gemini_api_key, model=SETTINGS.gemini_model,
             product_sizes=product.get("sizes"), timeout=SETTINGS.ocr_timeout_seconds,
-            max_rows=SETTINGS.max_chart_rows,
+            max_rows=SETTINGS.max_chart_rows, scope=scope,
         )
         if result.status == "found":
-            return Outcome("found", outcome.source_url, chart=result.chart, http_status=outcome.http_status)
-        statuses.append(result.status)
-        errors.append(f"{result.status}: {result.error}")
+            found.append(result.chart)
+        else:
+            statuses.append(result.status)
+            errors.append(f"{result.status}: {result.error}")
+
+    distinct = {json.dumps(c.sizes, sort_keys=True) + str(c.unit): c for c in found}
+    if len(distinct) == 1:
+        chart = found[0]
+        # A product-description image wins over a store-wide one with the same chart.
+        for c in found:
+            if c.evidence.get("chart_scope") == "product":
+                chart = c
+                break
+        return Outcome("found", outcome.source_url, chart=chart, http_status=outcome.http_status)
+    if len(distinct) > 1:
+        return Outcome("ocr_review", outcome.source_url, images=outcome.images,
+                       error=f"ocr: {len(distinct)} different size-chart images match this product")
 
     error = "; ".join(errors)[:MAX_ERROR_CHARS]
     if "error" in statuses:

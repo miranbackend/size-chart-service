@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -179,6 +181,81 @@ def size_overlap(chart_sizes, product_sizes) -> int:
     return len({_norm_size(s) for s in chart_sizes} & product)
 
 
+@dataclass
+class ImageReading:
+    """Product-independent result of reading one image (cached by URL)."""
+    status: str                     # chart | not_chart | disagree | ambiguous | error
+    sizes: dict[str, dict[str, str]] = field(default_factory=dict)
+    unit: str | None = None
+    basis: str | None = None
+    raw_rows: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+
+
+# Store-wide chart images appear on every product of a store; read each once.
+_CACHE: "OrderedDict[str, ImageReading]" = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+CACHE_SIZE = 5000
+
+
+def clear_cache() -> None:
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def read_image(client: httpx.Client, image_url: str, *, api_key: str, model: str,
+               timeout: float = 60, max_rows: int = 100) -> ImageReading:
+    with _CACHE_LOCK:
+        if image_url in _CACHE:
+            _CACHE.move_to_end(image_url)
+            return _CACHE[image_url]
+    reading = _read_image_uncached(client, image_url, api_key=api_key, model=model,
+                                   timeout=timeout, max_rows=max_rows)
+    if reading.status != "error":  # errors (quota, network) are retried later
+        with _CACHE_LOCK:
+            _CACHE[image_url] = reading
+            while len(_CACHE) > CACHE_SIZE:
+                _CACHE.popitem(last=False)
+    return reading
+
+
+def _read_image_uncached(client, image_url, *, api_key, model, timeout, max_rows) -> ImageReading:
+    try:
+        image, mime = fetch_image(client, image_url)
+        readings = [ask_gemini(client, api_key, model, prompt, image, mime, timeout) for prompt in PROMPTS]
+    except GeminiError as exc:
+        return ImageReading("error", error=str(exc))
+    except (httpx.HTTPError, ValueError) as exc:
+        return ImageReading("error", error=f"{type(exc).__name__}: {exc}"[:300])
+
+    if not all(r.get("is_measurement_chart") for r in readings):
+        return ImageReading("not_chart", error="image is not a measurement chart")
+    if any((r.get("chart_count") or 1) > 1 for r in readings):
+        return ImageReading("ambiguous", error="image holds more than one chart")
+
+    validated = []
+    for reading in readings:
+        clean, reason = validate_chart(reading_to_sizes(reading), max_rows)
+        if not clean:
+            return ImageReading("not_chart", error=f"image chart invalid: {reason}")
+        validated.append(clean)
+
+    units = {normalize_unit(r.get("unit")) for r in readings}
+    if validated[0] != validated[1] or len(units) != 1:
+        return ImageReading("disagree", error="the two reads of the image differ")
+
+    basis = readings[0].get("measurement_basis")
+    raw_by_label = {
+        normalize_size_label(clean_text(row.get("size"))): row
+        for row in readings[0].get("rows") or [] if isinstance(row, dict)
+    }
+    return ImageReading(
+        "chart", sizes=validated[0], unit=units.pop(),
+        basis=basis if basis in ("garment", "body") else None,
+        raw_rows={label: raw_by_label.get(label) for label in validated[0]},
+    )
+
+
 def read_chart_image(
     client: httpx.Client,
     image_url: str,
@@ -188,54 +265,28 @@ def read_chart_image(
     product_sizes: list[str] | None,
     timeout: float = 60,
     max_rows: int = 100,
+    scope: str = "product",
 ) -> OcrResult:
+    """Read one image and check its sizes against this product's sizes."""
     evidence: dict[str, Any] = {"image_url": image_url, "model": model}
-    try:
-        image, mime = fetch_image(client, image_url)
-        readings = [ask_gemini(client, api_key, model, prompt, image, mime, timeout) for prompt in PROMPTS]
-    except GeminiError as exc:
-        return OcrResult("error", error=str(exc), evidence=evidence)
-    except (httpx.HTTPError, ValueError) as exc:
-        return OcrResult("error", error=f"{type(exc).__name__}: {exc}"[:300], evidence=evidence)
+    reading = read_image(client, image_url, api_key=api_key, model=model,
+                         timeout=timeout, max_rows=max_rows)
+    if reading.status != "chart":
+        status = {"error": "error", "disagree": "disagree", "ambiguous": "ambiguous"}.get(
+            reading.status, "not_chart")
+        return OcrResult(status, error=reading.error, evidence=evidence)
 
-    if not all(r.get("is_measurement_chart") for r in readings):
-        return OcrResult("not_chart", error="image is not a measurement chart", evidence=evidence)
-    if any((r.get("chart_count") or 1) > 1 for r in readings):
-        return OcrResult("ambiguous", error="image holds more than one chart", evidence=evidence)
-
-    validated = []
-    for reading in readings:
-        clean, reason = validate_chart(reading_to_sizes(reading), max_rows)
-        if not clean:
-            return OcrResult("not_chart", error=f"image chart invalid: {reason}", evidence=evidence)
-        validated.append(clean)
-
-    units = {normalize_unit(r.get("unit")) for r in readings}
-    if validated[0] != validated[1] or len(units) != 1:
-        evidence["reads"] = validated
-        return OcrResult("disagree", error="the two reads of the image differ", evidence=evidence)
-
-    sizes = validated[0]
-    overlap = size_overlap(sizes, product_sizes)
-    evidence.update(reads_agree=True, size_overlap=overlap, product_sizes=list(product_sizes or []))
+    overlap = size_overlap(reading.sizes, product_sizes)
+    evidence.update(reads_agree=True, size_overlap=overlap, product_sizes=list(product_sizes or []),
+                    chart_scope=scope)
     needed = min(MIN_SIZE_OVERLAP, len(product_sizes or []))
     if not product_sizes or overlap < max(needed, 1):
         return OcrResult("size_mismatch", evidence=evidence,
-                         error=f"chart sizes {list(sizes)} don't match product sizes {list(product_sizes or [])}")
-
-    basis = readings[0].get("measurement_basis")
-    raw_by_label = {
-        normalize_size_label(clean_text(row.get("size"))): row
-        for row in readings[0].get("rows") or [] if isinstance(row, dict)
-    }
+                         error=f"chart sizes {list(reading.sizes)} don't match product sizes "
+                               f"{list(product_sizes or [])}")
     chart = Chart(
-        sizes=sizes,
-        unit=units.pop(),
-        method="image_ocr",
-        source="image",
-        confidence=0.70,
-        measurement_basis=basis if basis in ("garment", "body") else None,
-        evidence=evidence,
-        raw_rows={label: raw_by_label.get(label) for label in sizes},
+        sizes=reading.sizes, unit=reading.unit, method="image_ocr", source="image",
+        confidence=0.70 if scope == "product" else 0.65,
+        measurement_basis=reading.basis, evidence=evidence, raw_rows=reading.raw_rows,
     )
     return OcrResult("found", chart=chart, evidence=evidence)

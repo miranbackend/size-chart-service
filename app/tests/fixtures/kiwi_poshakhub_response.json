@@ -1,0 +1,626 @@
+{
+ "sizings": [
+  {
+   "id": 4377824,
+   "name": "Co-ord Set",
+   "isEnabled": true,
+   "conditionType": 0,
+   "tables": {
+    "lz8e9zy": {
+     "data": [
+      [
+       {
+        "type": "header",
+        "value": "SIZE",
+        "unitType": "string"
+       },
+       {
+        "type": "header",
+        "value": "BUST/CHEST LENGTH (IN)",
+        "unitType": "string"
+       },
+       {
+        "type": "header",
+        "value": "BOTTOM (IN) WAIST",
+        "unitType": "string"
+       },
+       {
+        "type": "header",
+        "value": "LENGTH BOTTOM (IN)",
+        "unitType": "string"
+       }
+      ],
+      [
+       {
+        "type": "header",
+        "value": "XS",
+        "unitType": "string"
+       },
+       {
+        "type": "single",
+        "value": "34",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "26",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "37",
+        "unitType": "in"
+       }
+      ],
+      [
+       {
+        "type": "header",
+        "value": "S",
+        "unitType": "string"
+       },
+       {
+        "type": "single",
+        "value": "36",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "28",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "37",
+        "unitType": "in"
+       }
+      ],
+      [
+       {
+        "type": "header",
+        "value": "M",
+        "unitType": "string"
+       },
+       {
+        "type": "single",
+        "value": "38",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "30",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "37",
+        "unitType": "in"
+       }
+      ],
+      [
+       {
+        "type": "header",
+        "value": "L",
+        "unitType": "string"
+       },
+       {
+        "type": "single",
+        "value": "40",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "32",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "38",
+        "unitType": "in"
+       }
+      ],
+      [
+       {
+        "type": "header",
+        "value": "XL",
+        "unitType": "string"
+       },
+       {
+        "type": "single",
+        "value": "42",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "34",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "38",
+        "unitType": "in"
+       }
+      ],
+      [
+       {
+        "type": "header",
+        "value": "XXL",
+        "unitType": "string"
+       },
+       {
+        "type": "single",
+        "value": "44",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "36",
+        "unitType": "in"
+       },
+       {
+        "type": "single",
+        "value": "38",
+        "unitType": "in"
+       }
+      ]
+     ],
+     "hide": false,
+     "type": 0,
+     "direction": "col"
+    }
+   },
+   "layout": {
+    "data": [
+     {
+      "type": 1,
+      "value": "lz8e9zy"
+     }
+    ]
+   },
+   "calculatorsSetup": null,
+   "advancedOptions": {
+    "priority": 1
+   },
+   "productInfo": null,
+   "createdAt": "2026-05-20T21:47:30.000Z",
+   "updatedAt": "2026-06-08T13:22:34.000Z",
+   "kiwiSettingsID": 129874,
+   "templateID": null,
+   "calculatorID": null,
+   "syncFromSizingID": null,
+   "productMatchings": [
+    {
+     "id": 7941505,
+     "type": "collection",
+     "value": "456366424315",
+     "matchingTypeMetafield": null,
+     "matchingTypeMetafieldKeyValue": null,
+     "isNegative": false
+    }
+   ],
+   "template": null,
+   "calculator": null,
+   "syncedKiwiSizing": null
+  }
+ ],
+ "settings": {
+  "id": 129874,
+  "isEnabled": true,
+  "displayMultipleUnitSystems": true,
+  "defaultUnitSystem": 0,
+  "conversionSignificantDecimalPoints": 1,
+  "sizingDisplayMode": 2,
+  "showUnitInHeader": false,
+  "buttonText": "Size Chart",
+  "buttonIcon": "tape2",
+  "modalHeaderText": "{{product.title}}",
+  "modalSubHeaderText": "Size Charts",
+  "styles": {
+   "spinnerColor": "black",
+   "floatButton": {
+    "enable": false,
+    "icon": "ruler1",
+    "text": "Size Chart",
+    "position": "bottom-right",
+    "orientation": "horizontal",
+    "mobile": true,
+    "desktop": true,
+    "desktopGap": 20,
+    "mobileGap": 20,
+    "background": "white",
+    "borderColor": "black",
+    "color": "black",
+    "italic": false,
+    "bold": true,
+    "font": null,
+    "underline": false,
+    "size": 13,
+    "verticalPadding": 5,
+    "horizontalPadding": 15,
+    "iconColor": "black"
+   },
+   "quickView": {
+    "enable": true,
+    "mobile": true,
+    "desktop": true,
+    "injectionSelector": ".",
+    "injectionOrder": 1,
+    "convertToRowUnitDirection": true,
+    "selectColor": "rgba(245,245,245,1)",
+    "type": "toggle",
+    "backgroundColor": "#ddd",
+    "fontColor": "#000",
+    "usePopoverInDesktop": false,
+    "inlineSizeInformation": true
+   },
+   "modal": {
+    "linkButton": {
+     "background": "white",
+     "borderColor": "rgba(108,126,83,1)",
+     "color": "rgba(108,126,83,1)",
+     "italic": false,
+     "bold": true,
+     "underline": false,
+     "size": 16,
+     "prefixText": "",
+     "suffixText": "",
+     "topMargin": 5,
+     "bottomMargin": 4,
+     "verticalPadding": 3,
+     "horizontalPadding": 4,
+     "alignment": "default",
+     "font": null,
+     "iconColor": "rgba(108,126,83,1)"
+    },
+    "header": {
+     "closeIcon": true,
+     "closeIconColor": "rgba(33, 43, 54,1)",
+     "alignment": "center",
+     "verticalPadding": 13,
+     "bottomBorderColor": "black"
+    },
+    "headerText": {
+     "italic": false,
+     "bold": true,
+     "color": "rgba(51, 51, 51, 1)",
+     "size": 17
+    },
+    "subHeaderText": {
+     "italic": false,
+     "bold": false,
+     "color": "rgba(51, 51, 51, 1)",
+     "size": 12
+    },
+    "modal": {
+     "animationType": 0,
+     "enableImageCarousel": false,
+     "style": 0,
+     "borderRadius": 5
+    },
+    "tabs": {
+     "italic": false,
+     "bold": false,
+     "fontSize": 18,
+     "calculatorTabText": "Calculate My Size",
+     "sizeChartTabText": "Size Chart",
+     "highlightColor": "#107be9",
+     "color": "#999",
+     "order": 0
+    }
+   },
+   "table": {
+    "defaultEditorMode": 0,
+    "inchesWithFeet": false,
+    "fixWidth": false,
+    "headerText": {
+     "alignment": "center",
+     "italic": false,
+     "bold": true,
+     "underline": false,
+     "color": "black",
+     "size": 14,
+     "margin": 5
+    },
+    "footerText": {
+     "alignment": "center",
+     "italic": false,
+     "bold": true,
+     "underline": false,
+     "color": "black",
+     "size": 14,
+     "margin": 5
+    },
+    "header": {
+     "bold": true,
+     "italic": false,
+     "capitalize": true,
+     "boldRow": true,
+     "boldCol": true,
+     "italicRow": false,
+     "italicCol": false,
+     "capitalizeRow": true,
+     "capitalizeCol": true,
+     "color": null,
+     "textWrap": true,
+     "size": null,
+     "sizeRow": null,
+     "sizeCol": null
+    },
+    "cell": {
+     "size": null,
+     "color": null,
+     "alignment": "center",
+     "verticalPadding": null,
+     "horizontalPadding": null,
+     "textWrap": false
+    },
+    "maxWidth": null,
+    "oddRowColor": "white",
+    "evenRowColor": "white",
+    "hoverColor": "rgba(245,245,245,1)",
+    "useColHover": true,
+    "borderColor": "#e8e9eb",
+    "borderWidth": 1,
+    "toggle": {
+     "color": "#107be9",
+     "position": "t-center",
+     "fontColor": "#999",
+     "fontSize": 13,
+     "borderRadius": 0,
+     "verticalPadding": 2,
+     "horizontalPadding": 10,
+     "style": 1
+    },
+    "mobile": {
+     "size": 12,
+     "verticalPadding": 2,
+     "horizontalPadding": 6
+    }
+   },
+   "divider": {
+    "color": "#818078",
+    "verticalMargin": 10,
+    "lineStyle": 0,
+    "text": {
+     "color": "#818078",
+     "size": 14,
+     "italic": false,
+     "underline": false,
+     "bold": false
+    }
+   },
+   "internationalChart": {
+    "names": {}
+   },
+   "tab": {
+    "verticalTabVerticalPadding": 10,
+    "verticalTabHorizontalPadding": 10,
+    "horizontalTabVerticalPadding": 10,
+    "horizontalTabHorizontalPadding": 10,
+    "italic": false,
+    "underline": false,
+    "bold": false,
+    "selectedColor": "black",
+    "unselectedColor": "#bbb",
+    "hoverColor": "#888",
+    "size": 14,
+    "showHighlightOnHover": true,
+    "highlight": {
+     "style": 1,
+     "color": "#107be9"
+    },
+    "border": {
+     "contentHasBorder": true,
+     "color": "#ccc",
+     "roundCorner": 0
+    },
+    "content": {
+     "verticalTabVerticalPadding": 10,
+     "verticalTabHorizontalPadding": 10,
+     "horizontalTabVerticalPadding": 15,
+     "horizontalTabHorizontalPadding": 15
+    }
+   },
+   "accordion": {
+    "container": {
+     "borderColor": null,
+     "borderRadius": 0,
+     "shadow": false
+    },
+    "header": {
+     "italic": false,
+     "underline": false,
+     "bold": true,
+     "size": 14,
+     "backgroundColor": "#2c3e50",
+     "textColor": "white",
+     "hoverBackgroundColor": "#1a252f",
+     "hoverTextColor": "white"
+    },
+    "content": {
+     "backgroundColor": "white"
+    }
+   },
+   "calculator": {
+    "defaultName": "Calculate My Size",
+    "hideSizeChartIfShow": false,
+    "advance": {
+     "defaultLanguage": "en",
+     "defaultBraSystem": 0,
+     "mainButtonColor": "#107be9",
+     "secondaryButtonColor": "black",
+     "ATCKey": "size",
+     "useTopTwo": false,
+     "useNewDetails": true,
+     "valueOfRange": "average"
+    },
+    "fitPreference": {
+     "enable": true,
+     "labelText": "Fit preference",
+     "type": "dropdown",
+     "default": "regular",
+     "slimText": "Slim",
+     "regularText": "Regular",
+     "looseText": "Loose"
+    },
+    "helpText": "",
+    "injectedLinkbutton": {
+     "noInputText": "What's my size?",
+     "hasResultText": "We recommend size: {result}",
+     "noResultText": "We couldn't find a good size match",
+     "background": "white",
+     "borderColor": "black",
+     "color": "black",
+     "italic": false,
+     "bold": false,
+     "underline": false,
+     "size": null,
+     "prefixText": "",
+     "suffixText": "",
+     "topMargin": 8,
+     "bottomMargin": 8,
+     "verticalPadding": null,
+     "horizontalPadding": null,
+     "iconColor": "black"
+    },
+    "radio": {
+     "buttonColor": "#107be9"
+    },
+    "slider": {
+     "fillColor": "rgb(16,123,233, 0.5)"
+    },
+    "header": {
+     "border": "#EBEBEB",
+     "borderWidth": 2,
+     "background": "#EBEBEB",
+     "verticalPadding": 10,
+     "horizontalPadding": 20,
+     "hideIfInModal": false
+    },
+    "headerText": {
+     "color": "black",
+     "size": 16,
+     "italic": false,
+     "underline": false,
+     "bold": true,
+     "alignment": "left"
+    },
+    "unitToggle": {
+     "color": "#107be9",
+     "position": "t-center",
+     "fontColor": "#999",
+     "fontSize": 13,
+     "borderRadius": 0,
+     "verticalPadding": 2,
+     "horizontalPadding": 10,
+     "style": 1
+    },
+    "resultPanel": {
+     "background": "#EBEBEB",
+     "verticalPadding": 8,
+     "horizontalPadding": 20
+    },
+    "recommendLabelText": {
+     "color": "000000",
+     "size": 13,
+     "italic": false,
+     "underline": false,
+     "bold": true,
+     "value": "We recommend the size:"
+    },
+    "recommendText": {
+     "color": "#000000",
+     "size": 36,
+     "italic": false,
+     "underline": false,
+     "bold": true
+    },
+    "noResultText": {
+     "color": "#000000",
+     "size": 20,
+     "italic": false,
+     "underline": false,
+     "bold": true,
+     "value": "We couldn't find a good match"
+    },
+    "labelText": {
+     "showColon": false,
+     "color": "#4D4D4D",
+     "size": 15,
+     "italic": false,
+     "underline": false,
+     "bold": false
+    },
+    "resultChart": {
+     "fieldText": {
+      "color": "black",
+      "size": 13,
+      "italic": false,
+      "underline": false,
+      "bold": false
+     },
+     "lowHighText": {
+      "color": "#959FAD",
+      "size": 11,
+      "italic": false,
+      "underline": false,
+      "bold": false
+     },
+     "coverTypeHighText": "Tight",
+     "coverTypeLowText": "Loose",
+     "lengthTypeHighText": "Short",
+     "lengthTypeLowText": "Long",
+     "greenColor": "#92cc92",
+     "redColor": "#ef7b7b"
+    },
+    "sizeCompare": {
+     "text": "See other sizes:",
+     "textStyle": {
+      "color": "black",
+      "size": 15,
+      "italic": false,
+      "underline": false,
+      "bold": true
+     },
+     "leftRightButtonColor": "black",
+     "button": {
+      "background": "#c3cbd0",
+      "color": "white",
+      "size": 12,
+      "italic": false,
+      "underline": false,
+      "bold": true
+     },
+     "selectedButton": {
+      "background": "#9aa5af",
+      "color": "white",
+      "size": 12,
+      "italic": false,
+      "underline": false,
+      "bold": true
+     }
+    },
+    "general": {
+     "alignment": "left"
+    }
+   }
+  },
+  "injectionSelector": ".size-buttons",
+  "maxNumDecimals": 1,
+  "injectionOrder": 1,
+  "unitDisplayMode": 0,
+  "hideUnitIfPresent": true,
+  "autoSelectUnitFromCountry": true,
+  "calculatorInjectionSelector": null,
+  "calculatorInjectionOrder": 0,
+  "calculatorDisplayMode": 2,
+  "showFraction": false,
+  "analytics": {},
+  "isReInjectEnabled": false,
+  "reInjectionSelector": "main",
+  "createdAt": "2025-09-29T07:40:37.000Z",
+  "updatedAt": "2026-07-03T19:06:32.000Z",
+  "shop": "poshakhub1.myshopify.com",
+  "version": "19"
+ },
+ "plan": 1
+}

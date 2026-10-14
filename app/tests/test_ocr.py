@@ -42,6 +42,8 @@ def client_for(readings, gemini_status=200, image_type="image/jpeg", seen=None):
 
 
 def read(client, sizes=("S", "M", "L", "XL")):
+    from ocr import clear_cache
+    clear_cache()
     return read_chart_image(client, IMAGE_URL, api_key=KEY, model="gemini-test", product_sizes=list(sizes))
 
 

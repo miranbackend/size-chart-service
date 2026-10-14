@@ -18,6 +18,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
+import ocr
 import worker
 from extraction import Chart
 
@@ -55,9 +56,14 @@ OCR_READING = {
              for s, c, l in (("S", "96", "102"), ("M", "101", "104"), ("L", "106", "106"))],
 }
 GEMINI_READINGS: list = []
+KIWI_RESPONSE = (FIXTURES / "kiwi_poshakhub_response.json").read_text(encoding="utf-8")
+KIWI_SNIPPET = (FIXTURES / "kiwi_poshakhub_snippet.html").read_text(encoding="utf-8").replace(
+    "9121477034235", str(SHOPIFY_ID))
+KIWI_PAGE = f"<html><head><title>Kurta</title></head><body>{KIWI_SNIPPET}{LONG}</body></html>"
 PAGES = {
     "/products/kurta": (200, SHOPIFY_PAGE),
     "/products/description-chart": (200, DESCRIPTION_PAGE),
+    "/products/kiwi": (200, KIWI_PAGE),
     "/products/captcha": (200, "<html><head><title>Robot Check</title></head><body>"
                                "Enter the characters you see below</body></html>"),
     "/products/sizes-only": (200, f"<html><body><ul><li>S</li><li>M</li></ul>"
@@ -133,11 +139,15 @@ def http(monkeypatch):
             raise httpx.ConnectError("connection refused", request=request)
         if request.url.host == "www.myntra.com":
             return httpx.Response(200, text=myntra, headers={"content-type": "text/html"})
+        if request.url.host == "app.kiwisizing.com":
+            assert request.url.params["product"] == str(SHOPIFY_ID)
+            return httpx.Response(200, text=KIWI_RESPONSE, headers={"content-type": "application/json"})
         if request.url.host == "generativelanguage.googleapis.com":
             reading = GEMINI_READINGS.pop(0)
             return httpx.Response(200, json={"status": "completed", "steps": [
                 {"type": "model_output", "content": [{"type": "text", "text": json.dumps(reading)}]}]})
-        if request.url.path == "/files/kurta-size-chart.jpg":
+        if request.url.path in ("/files/kurta-size-chart.jpg", "/files/Size_Chart_1.png",
+                                "/files/Size_Chart_2.png"):
             return httpx.Response(200, content=b"jpeg", headers={"content-type": "image/jpeg"})
         if request.url.path in SHOPIFY_JSON:
             return httpx.Response(200, text=json.dumps(SHOPIFY_JSON[request.url.path]),
@@ -150,6 +160,7 @@ def http(monkeypatch):
     monkeypatch.setattr(worker.SETTINGS, "browser_enabled", False)
     monkeypatch.setattr(worker.SETTINGS, "batch_size", 20)
     monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "")
+    ocr.clear_cache()
     yield calls
     client.close()
 
@@ -222,6 +233,7 @@ def test_shopify_json_description_chart_saved(conn, http):
                                      "L": {"chest": "42", "length": "42"}}
     assert row["chart"]["size_order"] == ["S", "M", "L"]
     assert row["chart"]["evidence"]["product_id_match"] is True
+    assert row["chart"]["chart_scope"] == "product"
     assert (row["chart_type"], row["unit"], row["source"], row["extraction_method"]) == \
         ("measurement_chart", "inch", "html", "shopify_description")
     assert row["source_url"] == "https://store.example.com/products/shopify-chart"
@@ -233,12 +245,14 @@ def test_shopify_json_description_chart_saved(conn, http):
     assert worker.process_once() == 0
 
 
-def test_store_wide_chart_is_not_saved(conn, http):
-    # Theme size-guide table on the page, not in the description.
+def test_store_wide_chart_saved_with_store_scope(conn, http):
+    # Theme size-guide table shown on the product page, not in the description.
     add_product(conn, 12, "https://store.example.com/products/kurta")
     worker.process_once()
-    assert check(conn, 12) == "generic_chart"
-    assert chart_row(conn, 12) is None
+    assert check(conn, 12) == "found"
+    row = chart_row(conn, 12)
+    assert row["chart"]["chart_scope"] == "store"
+    assert row["chart"]["sizes"]["M"] == {"chest": "40", "length": "41"}
 
 
 def test_table_in_page_description_saved(conn, http):
@@ -246,6 +260,7 @@ def test_table_in_page_description_saved(conn, http):
     worker.process_once()
     assert check(conn, 13) == "found"
     assert chart_row(conn, 13)["chart"]["evidence"]["in_product_description"] is True
+    assert chart_row(conn, 13)["chart"]["chart_scope"] == "product"
 
 
 def test_shopify_json_outcomes(conn, http):
@@ -286,7 +301,7 @@ def test_check_results_for_each_outcome(conn, http):
 
     assert check(conn, 21) == "blocked"
     assert check(conn, 22) == "not_found"
-    assert check(conn, 23) == "generic_chart"  # image not in the description
+    assert check(conn, 23) == "pending_ocr"    # store-wide image, no Gemini key in this test
     assert check(conn, 24) == "failed"
     assert check(conn, 25) == "not_found"      # 404
     assert check(conn, 26) is None
@@ -388,3 +403,49 @@ def test_without_key_image_stays_pending_ocr(conn, http):
     worker.process_once()
     assert check(conn, 73) == "pending_ocr"
     assert not any("googleapis" in u for u in http)
+
+
+def test_kiwi_chart_for_product_saved(conn, http):
+    add_product(conn, 80, "https://store.example.com/products/kiwi")
+    worker.process_once()
+    row = chart_row(conn, 80)
+    assert check(conn, 80) == "found"
+    assert row["source"] == "kiwi" and row["extraction_method"] == "kiwi_app"
+    assert row["unit"] == "inch"
+    assert row["chart"]["chart_scope"] == "collection"
+    assert row["chart"]["size_order"] == ["XS", "S", "M", "L", "XL", "XXL"]
+    assert row["chart"]["sizes"]["M"] == {"bust_chest_length": "38", "bottom_waist": "30",
+                                         "length_bottom": "37"}
+
+
+STORE_IMAGES_PAGE = (f"<html><body><div class='size-guide'><img src='/files/Size_Chart_1.png' alt='Size Chart'>"
+                     f"<img src='/files/Size_Chart_2.png' alt='Size Chart'></div>{LONG}</body></html>")
+
+
+def test_store_image_read_once_for_many_products(conn, http, monkeypatch):
+    monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "test-key")
+    PAGES["/products/store-image-a"] = PAGES["/products/store-image-b"] = (
+        200, STORE_IMAGES_PAGE.replace("<img src='/files/Size_Chart_2.png' alt='Size Chart'>", ""))
+    GEMINI_READINGS[:] = [OCR_READING, OCR_READING]           # enough for ONE image only
+    add_product(conn, 90, "https://store.example.com/products/store-image-a")
+    add_product(conn, 91, "https://store.example.com/products/store-image-b")
+
+    assert worker.process_once() == 2
+    for pid in (90, 91):
+        row = chart_row(conn, pid)
+        assert row["chart"]["chart_scope"] == "store" and row["extraction_method"] == "image_ocr"
+    assert sum("googleapis" in u for u in http) == 2           # 2 reads total, not 4
+
+
+def test_several_different_store_images_go_to_review(conn, http, monkeypatch):
+    monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "test-key")
+    PAGES["/products/store-images"] = (200, STORE_IMAGES_PAGE)
+    other = json.loads(json.dumps(OCR_READING))
+    for row in other["rows"]:
+        row["measurements"][0]["value"] = str(int(row["measurements"][0]["value"]) + 10)
+    GEMINI_READINGS[:] = [OCR_READING, OCR_READING, other, other]   # two images, two valid charts
+    add_product(conn, 92, "https://store.example.com/products/store-images")
+
+    worker.process_once()
+    assert check(conn, 92) == "ocr_review"
+    assert chart_row(conn, 92) is None
