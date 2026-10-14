@@ -1,12 +1,12 @@
 """
-Size-chart worker.
+Size-chart worker for the `products` table.
 
-    size_chart_jobs (claim_size_chart_jobs)
-        -> resolve retailer URL          (url_resolution.py)
-        -> fetch over HTTP, browser only when needed
-        -> extract product-specific chart (extraction.py)
-        -> gsa_product_measurement upsert + finish_size_chart_job
-           + gsa_product status, in one transaction
+    products (active, not yet checked or due for a re-check)
+        -> claimed via product_size_chart_checks.result = 'processing'
+        -> fetch the store page over HTTP, browser only when needed
+        -> extract a product-specific chart (extraction.py)
+        -> product_size_charts upsert + product_size_chart_checks result,
+           in one transaction
 
 Usage:
     python worker.py                                  # queue loop: WORKER_MODE=1 start, 0 stop
@@ -44,9 +44,7 @@ from extraction import (
     clean_text,
     extract_page,
     is_google_url,
-    site_from_url,
 )
-from url_resolution import resolve_product_url
 
 
 # ============================================================
@@ -91,15 +89,9 @@ class Settings:
     db_pool_size: int = field(default_factory=lambda: _env_int("DB_POOL_SIZE", 5))
     browser_wait_ms: int = field(default_factory=lambda: _env_int("BROWSER_WAIT_MS", 1500))
     max_chart_rows: int = field(default_factory=lambda: _env_int("MAX_CHART_ROWS", 100))
-    max_attempts: int = field(default_factory=lambda: _env_int("MAX_ATTEMPTS", 5))
     max_html_bytes: int = field(default_factory=lambda: _env_int("MAX_HTML_BYTES", 8_000_000))
     browser_enabled: bool = field(default_factory=lambda: _env_bool("BROWSER_ENABLED", True))
     browser_restart_every: int = field(default_factory=lambda: _env_int("BROWSER_RESTART_EVERY", 50))
-    # Fetching google.com/search from a datacenter mostly yields "unusual
-    # traffic" pages; only enable if you are permitted to and it helps.
-    google_http_resolution: bool = field(
-        default_factory=lambda: _env_bool("GOOGLE_HTTP_RESOLUTION", False)
-    )
 
 
 SETTINGS = Settings()
@@ -113,15 +105,6 @@ HTTP_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en;q=0.9",
 }
-
-# Retry delays (seconds). failed/blocked back off exponentially per attempt.
-NOT_FOUND_RETRY = 7 * 24 * 3600
-PENDING_OCR_RETRY = 7 * 24 * 3600
-UNRESOLVED_RETRY = 7 * 24 * 3600
-FAILED_RETRY_BASE, FAILED_RETRY_CAP = 30 * 60, 24 * 3600
-BLOCKED_RETRY_BASE, BLOCKED_RETRY_CAP = 6 * 3600, 72 * 3600
-EXHAUSTED_RETRY = 7 * 24 * 3600
-MAX_ERROR_CHARS = 2000
 
 
 # ============================================================
@@ -396,6 +379,7 @@ def extract_product(
     expected_title: str | None = None,
     http_client: httpx.Client | None = None,
     browser: BrowserFetcher | None = None,
+    known_product_ids: tuple[str, ...] = (),
 ) -> Outcome:
     """HTTP first; the browser only for pages that were reachable but had no chart."""
     adapter = adapter_for(url)
@@ -413,6 +397,7 @@ def extract_product(
         page = extract_page(
             fetched.html, fetched.final_url, requested_url=url, expected_title=expected_title,
             http_status=fetched.status, via="http", max_rows=SETTINGS.max_chart_rows,
+            known_product_ids=known_product_ids,
         )
         terminal = _outcome_from_page(page, fetched)
         if terminal:
@@ -431,6 +416,7 @@ def extract_product(
             page = extract_page(
                 rendered.html, rendered.final_url, requested_url=url, expected_title=expected_title,
                 http_status=rendered.status, via="browser", max_rows=SETTINGS.max_chart_rows,
+                known_product_ids=known_product_ids,
             )
             terminal = _outcome_from_page(page, rendered)
             if terminal:
@@ -447,294 +433,227 @@ def extract_product(
 
 
 # ============================================================
-# JOB OUTCOME POLICY
+# CHECK RESULTS + RECHECK POLICY
 # ============================================================
 
-@dataclass(frozen=True)
-class JobPlan:
-    job_status: str          # value passed to finish_size_chart_job
-    product_status: str      # gsa_product.size_chart_status
-    job_error: str | None
-    product_error: str | None
-    http_status: int | None
-    retry_seconds: int
+# product_size_chart_checks.result values
+RESULT_PROCESSING = "processing"
+OUTCOME_TO_RESULT = {
+    "found": "found",
+    "not_found": "not_found",
+    "image_chart": "pending_ocr",
+    "blocked": "blocked",
+    "failed": "failed",
+}
+
+# How long after its last check a product with this result is picked again.
+# 'found' is never re-checked automatically; 'processing' older than this
+# means the worker died mid-product.
+RECHECK_AFTER_SECONDS = {
+    RESULT_PROCESSING: 30 * 60,
+    "failed": 6 * 3600,
+    "blocked": 24 * 3600,
+    "not_found": 30 * 24 * 3600,
+    "pending_ocr": 30 * 24 * 3600,
+}
+MAX_ERROR_CHARS = 300
 
 
-def _backoff(attempts: int, base: int, cap: int, max_attempts: int) -> int:
-    if attempts >= max_attempts:
-        return EXHAUSTED_RETRY
-    return min(cap, base * 2 ** max(0, attempts - 1))
-
-
-def _trim(text: str | None) -> str | None:
-    return None if text is None else str(text)[:MAX_ERROR_CHARS]
-
-
-def plan_job(outcome: Outcome, attempts: int, max_attempts: int | None = None) -> JobPlan:
-    """
-    Map an extraction outcome to queue + product status.
-
-    The job table only accepts pending/processing/found/not_found/blocked/failed,
-    so an image chart finishes the job as not_found and marks the *product*
-    pending_ocr, with the candidate image URLs kept in size_chart_error.
-    """
-    max_attempts = max_attempts or SETTINGS.max_attempts
-    error = _trim(outcome.error)
-
-    if outcome.status == "found":
-        return JobPlan("found", "found", None, None, None, 0)
-    if outcome.status == "not_found":
-        return JobPlan("not_found", "not_found", None, error, None, NOT_FOUND_RETRY)
-    if outcome.status == "image_chart":
-        detail = _trim("pending_ocr: size chart image found; OCR not implemented; images="
-                       + json.dumps([i["url"] for i in outcome.images]))
-        return JobPlan("not_found", "pending_ocr", None, detail, None, PENDING_OCR_RETRY)
-    if outcome.status == "blocked":
-        retry = _backoff(attempts, BLOCKED_RETRY_BASE, BLOCKED_RETRY_CAP, max_attempts)
-        return JobPlan("blocked", "blocked", error or "blocked", error or "blocked",
-                       outcome.http_status, retry)
-    retry = _backoff(attempts, FAILED_RETRY_BASE, FAILED_RETRY_CAP, max_attempts)
-    return JobPlan("failed", "failed", error or "failed", error or "failed", None, retry)
+def result_for(outcome: Outcome) -> str:
+    return OUTCOME_TO_RESULT.get(outcome.status, "failed")
 
 
 # ============================================================
-# DATABASE WRITES
+# DATABASE (products / product_size_charts / product_size_chart_checks)
 # ============================================================
 
-def save_resolved_url(conn, product_id: int, resolution: dict[str, Any]) -> None:
-    conn.execute(
-        """
-        UPDATE gsa_product
-        SET resolved_product_url = %s,
-            resolved_retailer = %s,
-            url_resolution_status = %s,
-            url_resolution_error = %s,
-            url_resolved_at = NOW()
-        WHERE id = %s
-        """,
-        (
-            resolution.get("resolved_url"),
-            (resolution.get("retailer") or None) and resolution["retailer"][:200],
-            resolution.get("status"),
-            _trim(resolution.get("error")),
-            product_id,
-        ),
+_CLAIM_PRODUCTS = """
+    WITH picked AS (
+        SELECT p.id
+        FROM products p
+        LEFT JOIN product_size_chart_checks k ON k.product_id = p.id
+        WHERE p.is_active
+          AND NULLIF(TRIM(p.product_url), '') IS NOT NULL
+          AND (
+              k.product_id IS NULL
+              OR k.checked_at < NOW() - CASE k.result
+                  WHEN 'processing'  THEN %(processing)s * INTERVAL '1 second'
+                  WHEN 'failed'      THEN %(failed)s * INTERVAL '1 second'
+                  WHEN 'blocked'     THEN %(blocked)s * INTERVAL '1 second'
+                  WHEN 'not_found'   THEN %(not_found)s * INTERVAL '1 second'
+                  WHEN 'pending_ocr' THEN %(pending_ocr)s * INTERVAL '1 second'
+              END
+          )
+        ORDER BY k.checked_at ASC NULLS FIRST, p.id
+        LIMIT %(limit)s
+        FOR UPDATE OF p SKIP LOCKED
+    ),
+    claimed AS (
+        INSERT INTO product_size_chart_checks (product_id, result, checked_at)
+        SELECT id, 'processing', NOW() FROM picked
+        ON CONFLICT (product_id) DO UPDATE
+            SET result = EXCLUDED.result, checked_at = EXCLUDED.checked_at
+        RETURNING product_id
     )
+    SELECT p.id AS product_id, p.product_url, p.title, p.shopify_product_id
+    FROM claimed c
+    JOIN products p ON p.id = c.product_id
+    ORDER BY p.id
+"""
 
 
-_UPSERT_MEASUREMENT = """
-    INSERT INTO gsa_product_measurement (
-        product_id, size_label, measurements, unit, chart_type, source,
-        source_url, extraction_method, raw_data, confidence
-    )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (product_id, size_label) DO UPDATE SET
-        measurements = EXCLUDED.measurements,
-        unit = EXCLUDED.unit,
+def claim_products(limit: int) -> list[dict[str, Any]]:
+    """
+    Claim up to `limit` active products that are unchecked or due for a
+    re-check, marking them 'processing' in the same statement. SKIP LOCKED
+    keeps concurrent workers off each other's products.
+    """
+    params = {"limit": limit, **RECHECK_AFTER_SECONDS}
+    with get_pool().connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(_CLAIM_PRODUCTS, params)
+        return cur.fetchall()
+
+
+_UPSERT_CHART = """
+    INSERT INTO product_size_charts
+        (product_id, chart, chart_type, unit, source, source_url, extraction_method)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (product_id) DO UPDATE SET
+        chart = EXCLUDED.chart,
         chart_type = EXCLUDED.chart_type,
+        unit = EXCLUDED.unit,
         source = EXCLUDED.source,
         source_url = EXCLUDED.source_url,
         extraction_method = EXCLUDED.extraction_method,
-        raw_data = EXCLUDED.raw_data,
-        confidence = EXCLUDED.confidence,
         updated_at = NOW()
 """
 
 
+def chart_document(chart: Chart) -> dict[str, Any]:
+    """
+    The JSON stored in product_size_charts.chart. JSONB does not keep key
+    order, so the size order is stored explicitly.
+    """
+    return {
+        "sizes": chart.sizes,
+        "size_order": list(chart.sizes),
+        "unit": chart.unit,
+        "measurement_basis": chart.measurement_basis,
+        "confidence": chart.confidence,
+        "evidence": chart.evidence,
+        "raw_rows": chart.raw_rows,
+        "extracted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def save_chart(conn, product_id: int, chart: Chart, source_url: str) -> int:
-    """
-    Upsert one row per size and drop sizes that are no longer in the chart,
-    so re-processing a product converges on exactly the current chart.
-    """
-    extracted_at = datetime.now(timezone.utc).isoformat()
-    size_order = list(chart.sizes)
-    params = []
-    for label, measurements in chart.sizes.items():
-        if len(label) > 100:
-            continue
-        raw = {
-            "row": chart.raw_rows.get(label),
-            "size_order": size_order,
-            "measurement_basis": chart.measurement_basis,
-            "evidence": chart.evidence,
-            "chart": chart.raw,
-            "extracted_at": extracted_at,
-        }
-        params.append((
-            product_id, label, Jsonb(measurements), (chart.unit or None),
-            chart.chart_type[:100], chart.source[:100], source_url,
-            chart.method[:50], Jsonb(raw), chart.confidence,
-        ))
-    if len(params) < 2:
-        raise ValueError(f"refusing to save chart with {len(params)} usable size rows")
-
-    with conn.cursor() as cur:
-        cur.executemany(_UPSERT_MEASUREMENT, params)
-        cur.execute(
-            "DELETE FROM gsa_product_measurement WHERE product_id = %s AND NOT (size_label = ANY(%s))",
-            (product_id, [p[1] for p in params]),
-        )
-    return len(params)
-
-
-def finish_job(conn, job_id: int, plan: JobPlan) -> None:
+    if len(chart.sizes) < 2:
+        raise ValueError(f"refusing to save chart with {len(chart.sizes)} size rows")
     conn.execute(
-        "SELECT finish_size_chart_job(%s::bigint, %s::text, %s::text, %s::integer, %s::integer)",
-        (job_id, plan.job_status, plan.job_error, plan.http_status, plan.retry_seconds),
+        _UPSERT_CHART,
+        (
+            product_id,
+            Jsonb(chart_document(chart)),
+            chart.chart_type,
+            chart.unit or "unknown",  # unit is NOT NULL
+            "browser" if chart.method.startswith("browser_") else "html",
+            source_url,
+            chart.method,
+        ),
     )
+    return len(chart.sizes)
 
 
-def update_product_status(conn, product_id: int, status: str, error: str | None) -> None:
+def record_check(conn, product_id: int, result: str) -> None:
     conn.execute(
         """
-        UPDATE gsa_product
-        SET size_chart_status = %s,
-            size_chart_last_checked_at = NOW(),
-            size_chart_error = %s
-        WHERE id = %s
+        INSERT INTO product_size_chart_checks (product_id, result, checked_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (product_id) DO UPDATE
+            SET result = EXCLUDED.result, checked_at = EXCLUDED.checked_at
         """,
-        (status, _trim(error), product_id),
+        (product_id, result),
     )
 
 
-def finalize_job(
-    job: dict[str, Any],
-    outcome: Outcome,
-    resolution: dict[str, Any] | None,
-) -> JobPlan:
-    """Persist everything for one job atomically."""
-    plan = plan_job(outcome, job.get("attempts") or 1)
+def finalize_product(product: dict[str, Any], outcome: Outcome) -> str:
+    """Save the chart (if any) and the check result atomically."""
+    result = result_for(outcome)
     with get_pool().connection() as conn, conn.transaction():
-        if resolution is not None:
-            save_resolved_url(conn, job["product_id"], resolution)
         if outcome.status == "found":
-            save_chart(conn, job["product_id"], outcome.chart, outcome.source_url)
-        finish_job(conn, job["job_id"], plan)
-        # finish_size_chart_job also sets product status, but it cannot express
-        # pending_ocr; setting it explicitly keeps both in agreement.
-        update_product_status(conn, job["product_id"], plan.product_status, plan.product_error)
-    return plan
+            save_chart(conn, product["product_id"], outcome.chart, outcome.source_url)
+        record_check(conn, product["product_id"], result)
+    return result
 
 
-# ============================================================
-# QUEUE
-# ============================================================
-
-def claim_jobs(limit: int) -> list[dict[str, Any]]:
-    """
-    Claim via claim_size_chart_jobs(text, integer). The explicit casts pick
-    the integer overload; psycopg would otherwise send a small Python int as
-    int2 and silently hit the smallint overload.
-    """
-    with get_pool().connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT * FROM claim_size_chart_jobs(%s::text, %s::integer)",
-                    (SETTINGS.worker_id, limit))
-        claimed = cur.fetchall()
-        job_ids = [row.get("job_id", row.get("id")) for row in claimed]
-        if not job_ids:
-            return []
-        cur.execute(
-            """
-            SELECT j.id AS job_id, j.attempts, p.id AS product_id, p.product_url, p.title,
-                   p.resolved_product_url, p.resolved_retailer, p.url_resolution_status,
-                   CASE WHEN p.product_url ILIKE '%%google.%%' THEN p.raw END AS raw
-            FROM size_chart_jobs j
-            JOIN gsa_product p ON p.id = j.product_id
-            WHERE j.id = ANY(%s)
-            ORDER BY j.id
-            """,
-            (job_ids,),
-        )
-        return cur.fetchall()
-
-
-def resolve_for_job(job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    """(resolution, changed). A previous successful retailer resolution is reused."""
-    cached = job.get("resolved_product_url")
-    if (job.get("url_resolution_status") == "resolved" and cached
-            and not is_google_url(cached)):
-        return {"status": "resolved", "resolved_url": cached,
-                "retailer": job.get("resolved_retailer") or site_from_url(cached),
-                "method": "cached"}, False
-    resolution = resolve_product_url(
-        job.get("product_url") or "", job.get("raw"),
-        http_client=get_http_client(), allow_google_http=SETTINGS.google_http_resolution,
-    )
-    return resolution, True
-
-
-def resolution_outcome(resolution: dict[str, Any]) -> Outcome | None:
-    """Outcome when no retailer page can be processed, else None."""
-    status = resolution.get("status")
-    if status == "resolved":
-        return None
-    if status == "blocked":
-        return Outcome("blocked", error=f"url_resolution: {resolution.get('error')}",
-                       http_status=resolution.get("http_status"))
-    if status == "unresolved":
-        return Outcome("not_found", error=f"retailer_url_unresolved: {resolution.get('error')}")
-    return Outcome("failed", error=f"url_resolution: {resolution.get('error')}")
-
-
-def process_job(job: dict[str, Any]) -> JobPlan:
-    started = time.monotonic()
-    resolution: dict[str, Any] | None = None
+def release_products(products: list[dict[str, Any]]) -> None:
+    """On shutdown, hand back claimed-but-unprocessed products immediately."""
+    ids = [p["product_id"] for p in products]
+    if not ids:
+        return
     try:
-        resolution, changed = resolve_for_job(job)
-        outcome = resolution_outcome(resolution)
-        if outcome is None:
-            outcome = extract_product(resolution["resolved_url"], job.get("title"),
-                                      get_http_client(), get_browser())
-        if not changed:
-            resolution = None
-    except Exception as exc:
-        log.exception("extraction error job=%s product=%s", job["job_id"], job["product_id"])
-        outcome = Outcome("failed", error=f"{type(exc).__name__}: {exc}")
+        with get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM product_size_chart_checks WHERE product_id = ANY(%s) AND result = %s",
+                (ids, RESULT_PROCESSING),
+            )
+    except Exception:
+        log.exception("could not release %s products", len(ids))
 
-    plan = finalize_job(job, outcome, resolution)
+
+# ============================================================
+# PROCESSING
+# ============================================================
+
+def known_ids(product: dict[str, Any]) -> tuple[str, ...]:
+    sid = product.get("shopify_product_id")
+    return (str(sid),) if sid else ()
+
+
+def process_product(product: dict[str, Any]) -> str:
+    started = time.monotonic()
+    url = (product.get("product_url") or "").strip()
+    try:
+        if is_google_url(url):
+            outcome = Outcome("not_found", url, error="product_url is a Google URL, not a store page")
+        else:
+            outcome = extract_product(url, product.get("title"), get_http_client(),
+                                      get_browser(), known_product_ids=known_ids(product))
+    except Exception as exc:
+        log.exception("extraction error product=%s", product["product_id"])
+        outcome = Outcome("failed", url, error=f"{type(exc).__name__}: {exc}")
+
+    result = finalize_product(product, outcome)
     log_event(
-        "job_done",
-        job=job["job_id"], product=job["product_id"], attempts=job.get("attempts"),
-        status=plan.product_status,
-        site=site_from_url(outcome.source_url) if outcome.source_url else None,
+        "product_done",
+        product=product["product_id"], result=result,
         rows=len(outcome.chart.sizes) if outcome.chart else None,
         method=outcome.chart.method if outcome.chart else None,
         confidence=outcome.chart.confidence if outcome.chart else None,
-        http=outcome.http_status, error=(outcome.error or "")[:200] or None,
-        ms=int((time.monotonic() - started) * 1000),
+        id_in_page=outcome.chart.evidence.get("product_id_in_page") if outcome.chart else None,
+        images=[i["url"] for i in outcome.images][:3] or None,
+        http=outcome.http_status, error=(outcome.error or "")[:MAX_ERROR_CHARS] or None,
+        url=url[:200], ms=int((time.monotonic() - started) * 1000),
     )
-    return plan
-
-
-def release_jobs(jobs: list[dict[str, Any]]) -> None:
-    """Hand back claimed-but-unprocessed jobs on shutdown instead of waiting for stale recovery."""
-    plan = JobPlan("failed", "pending", "worker shutdown before processing",
-                   "worker shutdown before processing", None, 0)
-    for job in jobs:
-        try:
-            with get_pool().connection() as conn, conn.transaction():
-                finish_job(conn, job["job_id"], plan)
-                update_product_status(conn, job["product_id"], "pending", None)
-        except Exception:
-            log.exception("could not release job=%s", job["job_id"])
+    return result
 
 
 _stop = threading.Event()
 
 
 def process_once() -> int:
-    jobs = claim_jobs(SETTINGS.batch_size)
+    products = claim_products(SETTINGS.batch_size)
     processed = 0
-    for i, job in enumerate(jobs):
+    for i, product in enumerate(products):
         if _stop.is_set():
-            release_jobs(jobs[i:])
+            release_products(products[i:])
             break
         try:
-            process_job(job)
+            process_product(product)
         except Exception:
-            # finalize_job itself failed (DB down?). The job stays 'processing'
-            # and recover_stale_size_chart_jobs will hand it back.
-            log.exception("could not persist job=%s product=%s", job["job_id"], job["product_id"])
+            # Saving failed (DB down?). The 'processing' mark expires after
+            # RECHECK_AFTER_SECONDS['processing'] and the product is retried.
+            log.exception("could not persist product=%s", product["product_id"])
         processed += 1
     return processed
 
@@ -767,7 +686,7 @@ def run_worker() -> None:
         return
 
     log_event("worker_started", worker=SETTINGS.worker_id, batch=SETTINGS.batch_size,
-              browser=SETTINGS.browser_enabled, google_http=SETTINGS.google_http_resolution)
+              browser=SETTINGS.browser_enabled)
     try:
         while not _stop.is_set():
             try:
@@ -802,11 +721,7 @@ def _print_outcome(outcome: Outcome) -> None:
 
 
 def cli_extract_url(url: str, title: str | None, use_browser: bool) -> None:
-    resolution = resolve_product_url(url, None, http_client=get_http_client(),
-                                     allow_google_http=SETTINGS.google_http_resolution)
-    outcome = resolution_outcome(resolution) or extract_product(
-        resolution["resolved_url"], title, get_http_client(),
-        get_browser() if use_browser else None)
+    outcome = extract_product(url, title, get_http_client(), get_browser() if use_browser else None)
     _print_outcome(outcome)
 
 
@@ -822,27 +737,23 @@ def cli_extract_file(path: str, url: str, title: str | None) -> None:
 
 
 def cli_dry_run(product_id: int, use_browser: bool) -> None:
-    """Resolve + extract one product from the DB without writing anything."""
+    """Extract one product from the `products` table without writing anything."""
     with get_pool().connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
-            """
-            SELECT 0 AS job_id, 1 AS attempts, id AS product_id, product_url, title, raw,
-                   resolved_product_url, resolved_retailer, url_resolution_status
-            FROM gsa_product WHERE id = %s
-            """,
+            "SELECT id AS product_id, product_url, title, shopify_product_id, is_active "
+            "FROM products WHERE id = %s",
             (product_id,),
         )
-        job = cur.fetchone()
-    if not job:
-        raise SystemExit(f"product {product_id} not found")
-    resolution, _changed = resolve_for_job(job)
-    print(json.dumps({"resolution": {k: v for k, v in resolution.items() if k != "candidates"}},
-                     indent=2, default=str))
-    outcome = resolution_outcome(resolution) or extract_product(
-        resolution["resolved_url"], job.get("title"), get_http_client(),
-        get_browser() if use_browser else None)
+        product = cur.fetchone()
+    if not product:
+        raise SystemExit(f"product {product_id} not found in products")
+    print(json.dumps({"product": product}, indent=2, default=str))
+    outcome = extract_product(product["product_url"], product.get("title"), get_http_client(),
+                              get_browser() if use_browser else None,
+                              known_product_ids=known_ids(product))
     _print_outcome(outcome)
-    print(json.dumps({"would_store": plan_job(outcome, 1).__dict__}, indent=2))
+    print(json.dumps({"would_record_result": result_for(outcome),
+                      "would_save_chart": outcome.status == "found"}, indent=2))
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -1339,6 +1339,15 @@ def _pick_candidate(candidates: list[Candidate]) -> tuple[Candidate, int]:
     return best, len(candidates)
 
 
+def product_id_in_page(html: str, product_ids: tuple[str, ...]) -> bool:
+    """True when one of the ids appears in the page as a whole number."""
+    for pid in product_ids:
+        pid = str(pid or "").strip()
+        if len(pid) >= 5 and re.search(rf"(?<![\d]){re.escape(pid)}(?![\d])", html or ""):
+            return True
+    return False
+
+
 def extract_page(
     html: str,
     url: str,
@@ -1348,12 +1357,15 @@ def extract_page(
     http_status: int | None = None,
     via: str = "http",
     max_rows: int = DEFAULT_MAX_CHART_ROWS,
+    known_product_ids: tuple[str, ...] = (),
 ) -> PageResult:
     """
     Run the full extraction priority on one page.
 
     `url` is the final (post-redirect) URL; `requested_url` the URL we asked
-    for, used to detect redirects away from the product.
+    for, used to detect redirects away from the product. `known_product_ids`
+    are ids we already know for this product (e.g. shopify_product_id); one of
+    them appearing in the page ties the page, and its chart, to the product.
     """
     soup = BeautifulSoup(html or "", "lxml")
     site = site_from_url(url)
@@ -1372,8 +1384,10 @@ def extract_page(
             error=f"redirected away from product {requested_id} to {url[:200]}",
         )
 
-    product_ids = tuple(p for p in (final_id,) if p)
-    evidence: dict[str, Any] = {"site": site, "url_product_id": final_id}
+    product_ids = tuple(dict.fromkeys(p for p in (final_id, *known_product_ids) if p))
+    id_in_page = product_id_in_page(html, known_product_ids)
+    evidence: dict[str, Any] = {"site": site, "url_product_id": final_id,
+                                "product_id_in_page": id_in_page}
 
     overlap = title_overlap(expected_title, page_titles(soup))
     evidence["title_overlap"] = None if overlap is None else round(overlap, 3)
@@ -1400,7 +1414,7 @@ def extract_page(
     if candidates:
         best, count = _pick_candidate(candidates)
         evidence["candidate_count"] = count
-        strong = bool(best.evidence.get("product_id_in_context"))
+        strong = bool(best.evidence.get("product_id_in_context")) or id_in_page
         return _found(best, site, prefix, evidence, overlap, strong_id=strong)
 
     # 5. Image candidates (OCR is a separate stage).
