@@ -671,8 +671,11 @@ def result_for(outcome: Outcome) -> str:
 # ============================================================
 
 _CLAIM_PRODUCTS = """
-    WITH picked AS (
-        SELECT p.id
+    WITH due AS (
+        -- At most one due product per store per batch, so the threads of a
+        -- batch never queue behind each other's per-store pacing.
+        SELECT DISTINCT ON (p.store_id)
+               p.id, k.checked_at, (p.id * 2654435761) %% 4294967291 AS spread
         FROM products p
         LEFT JOIN product_size_chart_checks k ON k.product_id = p.id
         WHERE p.is_active
@@ -689,9 +692,13 @@ _CLAIM_PRODUCTS = """
                   WHEN 'ocr_review'  THEN %(ocr_review)s * INTERVAL '1 second'
               END
           )
-        -- Spread each batch across stores (a store's products have consecutive
-        -- ids) so per-store pacing rarely waits and no store gets bursts.
-        ORDER BY k.checked_at ASC NULLS FIRST, (p.id * 2654435761) %% 4294967291, p.id
+        ORDER BY p.store_id, k.checked_at ASC NULLS FIRST, (p.id * 2654435761) %% 4294967291
+    ),
+    picked AS (
+        SELECT p.id
+        FROM due d
+        JOIN products p ON p.id = d.id
+        ORDER BY d.checked_at ASC NULLS FIRST, d.spread
         LIMIT %(limit)s
         FOR UPDATE OF p SKIP LOCKED
     ),

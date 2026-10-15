@@ -176,11 +176,11 @@ def http(monkeypatch):
 
 
 def add_product(conn, pid, url, title="Linen Kurta", shopify_id=SHOPIFY_ID, active=True,
-                sizes=("S", "M", "L", "XL")):
+                sizes=("S", "M", "L", "XL"), store_id=None):
     conn.execute(
-        "INSERT INTO products (id, shopify_product_id, title, product_url, is_active, sizes) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
-        (pid, shopify_id, title, url, active, list(sizes)),
+        "INSERT INTO products (id, store_id, shopify_product_id, title, product_url, is_active, sizes) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (pid, store_id if store_id is not None else pid, shopify_id, title, url, active, list(sizes)),
     )
 
 
@@ -534,3 +534,15 @@ def test_batch_runs_products_concurrently(conn, http, monkeypatch):
     # 8 products x (robots + .js) x 0.3 s = 4.8 s one by one; in parallel ~0.6 s
     assert elapsed < 2.5, elapsed
     assert {check(conn, pid) for pid in range(200, 208)} == {"found"}
+
+
+def test_batch_takes_one_product_per_store(conn, http):
+    # Real case (babyhug.in): a big store filled whole batches and its products
+    # queued behind each other's per-store pacing.
+    for pid in range(300, 320):
+        add_product(conn, pid, f"https://big.example.com/products/p{pid}", store_id=1)
+    for pid in range(320, 325):
+        add_product(conn, pid, f"https://small{pid}.example.com/products/p", store_id=pid)
+    batch = worker.claim_products(8)
+    stores = [p["product_url"].split("/")[2] for p in batch]
+    assert len(stores) == len(set(stores)) == 6      # 5 small stores + 1 from the big store
