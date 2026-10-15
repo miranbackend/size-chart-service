@@ -26,6 +26,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
@@ -103,6 +104,10 @@ class Settings:
     # larger than this is honoured instead.
     per_host_delay_ms: int = field(default_factory=lambda: _env_int("PER_HOST_DELAY_MS", 1000))
     respect_robots: bool = field(default_factory=lambda: _env_bool("RESPECT_ROBOTS_TXT", True))
+    # Products processed at the same time per worker. Batches span different
+    # stores and per-store pacing is shared by all threads, so stores see the
+    # same request rate; a slow store just no longer holds up the others.
+    concurrency: int = field(default_factory=lambda: max(1, _env_int("CONCURRENCY", 8)))
     browser_enabled: bool = field(default_factory=lambda: _env_bool("BROWSER_ENABLED", True))
     browser_restart_every: int = field(default_factory=lambda: _env_int("BROWSER_RESTART_EVERY", 50))
     # Size-chart images in the product description are read with Gemini when a key is set.
@@ -216,7 +221,8 @@ def get_http_client() -> httpx.Client:
             follow_redirects=True,
             max_redirects=10,
             timeout=httpx.Timeout(SETTINGS.http_timeout_seconds, connect=10),
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            limits=httpx.Limits(max_connections=max(10, SETTINGS.concurrency * 3),
+                                max_keepalive_connections=max(5, SETTINGS.concurrency * 2)),
         )
     return _http_client
 
@@ -268,17 +274,25 @@ def robots_for(client: httpx.Client, url: str) -> RobotFileParser | None:
     return parser
 
 
+_host_lock = threading.Lock()
+
+
 def wait_for_host(url: str, crawl_delay: float | None = None) -> None:
-    """Keep at least PER_HOST_DELAY_MS (or the store's Crawl-delay) between requests to one store."""
+    """
+    Keep at least PER_HOST_DELAY_MS (or the store's Crawl-delay) between
+    requests to one store, across all threads: each request reserves the
+    next free slot for its store, then waits for it.
+    """
     gap = max(SETTINGS.per_host_delay_ms / 1000, float(crawl_delay or 0))
     host = urlparse(url).netloc.lower()
-    if gap > 0:
-        remaining = _last_request.get(host, 0) + gap - time.monotonic()
-        if remaining > 0:
-            _stop.wait(min(remaining, 60))
-    if len(_last_request) > MAX_TRACKED_HOSTS:
-        _last_request.clear()
-    _last_request[host] = time.monotonic()
+    with _host_lock:
+        now = time.monotonic()
+        slot = max(now, _last_request.get(host, 0) + gap) if gap > 0 else now
+        if len(_last_request) > MAX_TRACKED_HOSTS:
+            _last_request.clear()
+        _last_request[host] = slot
+    if slot > now:
+        _stop.wait(min(slot - now, 60))
 
 
 def fetch_store_page(client: httpx.Client, url: str) -> FetchResult:
@@ -411,6 +425,7 @@ class BrowserFetcher:
 
 
 _browser: BrowserFetcher | None = None
+_browser_lock = threading.Lock()
 
 
 def get_browser() -> BrowserFetcher | None:
@@ -589,7 +604,8 @@ def extract_product(
 
     if browser is not None and adapter.use_browser and not images:
         try:
-            rendered = browser.fetch(url, adapter)
+            with _browser_lock:
+                rendered = browser.fetch(url, adapter)
         except Exception as exc:  # Playwright raises many error types; all mean "no render"
             errors.append(f"browser: {type(exc).__name__}: {clean_text(exc)[:300]}")
             browser.close()
@@ -919,7 +935,12 @@ def process_product(product: dict[str, Any]) -> str:
             outcome = extract_product(url, product.get("title"), get_http_client(),
                                       get_browser(), known_product_ids=known_ids(product),
                                       shopify_product_id=product.get("shopify_product_id"))
-        if outcome.status == "image_chart" and ocr_enabled():
+        if outcome.status == "image_chart" and not product.get("sizes"):
+            # An image chart can only be accepted when its sizes match the
+            # product's sizes, so don't leave these for a later OCR pass.
+            outcome = Outcome("not_found", outcome.source_url, images=outcome.images,
+                              error="size chart image found but the product has no sizes to check it against")
+        elif outcome.status == "image_chart" and ocr_enabled():
             outcome = apply_ocr(outcome, product)
     except Exception as exc:
         log.exception("extraction error product=%s", product["product_id"])
@@ -943,21 +964,39 @@ def process_product(product: dict[str, Any]) -> str:
 _stop = threading.Event()
 
 
+_executor: ThreadPoolExecutor | None = None
+
+
+def get_executor() -> ThreadPoolExecutor:
+    global _executor
+    if _executor is None:
+        _executor = ThreadPoolExecutor(max_workers=SETTINGS.concurrency, thread_name_prefix="product")
+    return _executor
+
+
+def _run_product(product: dict[str, Any]) -> bool:
+    """True when processed; False when skipped because the worker is stopping."""
+    if _stop.is_set():
+        return False
+    try:
+        process_product(product)
+    except Exception:
+        # Saving failed (DB down?). The 'processing' mark expires after
+        # RECHECK_AFTER_SECONDS['processing'] and the product is retried.
+        log.exception("could not persist product=%s", product["product_id"])
+    return True
+
+
 def process_once() -> int:
-    products = claim_products(SETTINGS.batch_size)
-    processed = 0
-    for i, product in enumerate(products):
-        if _stop.is_set():
-            release_products(products[i:])
-            break
-        try:
-            process_product(product)
-        except Exception:
-            # Saving failed (DB down?). The 'processing' mark expires after
-            # RECHECK_AFTER_SECONDS['processing'] and the product is retried.
-            log.exception("could not persist product=%s", product["product_id"])
-        processed += 1
-    return processed
+    products = claim_products(max(SETTINGS.batch_size, SETTINGS.concurrency))
+    if SETTINGS.concurrency <= 1:
+        done = [_run_product(p) for p in products]
+    else:
+        done = list(get_executor().map(_run_product, products))
+    skipped = [p for p, ok in zip(products, done) if not ok]
+    if skipped:
+        release_products(skipped)
+    return sum(done)
 
 
 # ============================================================
@@ -988,6 +1027,7 @@ def run_worker() -> None:
         return
 
     log_event("worker_started", worker=SETTINGS.worker_id, batch=SETTINGS.batch_size,
+              concurrency=SETTINGS.concurrency,
               browser=SETTINGS.browser_enabled,
               ocr=f"gemini:{SETTINGS.gemini_model}" if ocr_enabled() else "off")
     try:
@@ -999,6 +1039,8 @@ def run_worker() -> None:
                 log.exception("worker loop error")
                 _stop.wait(SETTINGS.poll_seconds)
     finally:
+        if _executor is not None:
+            _executor.shutdown(wait=True)
         if _browser is not None:
             _browser.close()
         if _http_client is not None:

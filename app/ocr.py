@@ -225,22 +225,35 @@ CACHE_SIZE = 5000
 def clear_cache() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
+        _URL_LOCKS.clear()
+
+
+_URL_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _url_lock(image_url: str) -> threading.Lock:
+    with _CACHE_LOCK:
+        if len(_URL_LOCKS) > CACHE_SIZE:
+            _URL_LOCKS.clear()
+        return _URL_LOCKS.setdefault(image_url, threading.Lock())
 
 
 def read_image(client: httpx.Client, image_url: str, *, api_key: str, model: str,
                timeout: float = 60, max_rows: int = 100) -> ImageReading:
-    with _CACHE_LOCK:
-        if image_url in _CACHE:
-            _CACHE.move_to_end(image_url)
-            return _CACHE[image_url]
-    reading = _read_image_uncached(client, image_url, api_key=api_key, model=model,
-                                   timeout=timeout, max_rows=max_rows)
-    if reading.status != "error":  # errors (quota, network) are retried later
+    # One read per image even when several threads need it at the same time.
+    with _url_lock(image_url):
         with _CACHE_LOCK:
-            _CACHE[image_url] = reading
-            while len(_CACHE) > CACHE_SIZE:
-                _CACHE.popitem(last=False)
-    return reading
+            if image_url in _CACHE:
+                _CACHE.move_to_end(image_url)
+                return _CACHE[image_url]
+        reading = _read_image_uncached(client, image_url, api_key=api_key, model=model,
+                                       timeout=timeout, max_rows=max_rows)
+        if reading.status != "error":  # errors (quota, network) are retried later
+            with _CACHE_LOCK:
+                _CACHE[image_url] = reading
+                while len(_CACHE) > CACHE_SIZE:
+                    _CACHE.popitem(last=False)
+        return reading
 
 
 def _read_image_uncached(client, image_url, *, api_key, model, timeout, max_rows) -> ImageReading:

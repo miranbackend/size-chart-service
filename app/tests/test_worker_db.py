@@ -502,3 +502,35 @@ def test_kiwi_outage_is_retried_not_marked_not_found(conn, http):
         assert chart_row(conn, 97) is None
     finally:
         KIWI_DOWN.clear()
+
+
+def test_text_first_phase_leaves_images_for_later(conn, http):
+    """OCR off: image-only products wait as pending_ocr, without sizes they're not_found."""
+    PAGES["/products/img-sized"] = PAGES["/products/img-nosize"] = (200, STORE_IMAGES_PAGE)
+    add_product(conn, 98, "https://store.example.com/products/img-sized")
+    add_product(conn, 99, "https://store.example.com/products/img-nosize", sizes=())
+    worker.process_once()
+    assert check(conn, 98) == "pending_ocr"
+    assert check(conn, 99) == "not_found"
+    assert not any("googleapis" in u for u in http)
+
+
+def test_batch_runs_products_concurrently(conn, http, monkeypatch):
+    import time
+    monkeypatch.setattr(worker.SETTINGS, "concurrency", 8)
+    worker._executor = None
+    for pid in range(200, 208):
+        add_product(conn, pid, f"https://store{pid}.example.com/products/shopify-chart")
+    slow = worker.fetch_http
+
+    def delayed(client, url):
+        time.sleep(0.3)
+        return slow(client, url)
+
+    monkeypatch.setattr(worker, "fetch_http", delayed)
+    start = time.monotonic()
+    assert worker.process_once() == 8
+    elapsed = time.monotonic() - start
+    # 8 products x (robots + .js) x 0.3 s = 4.8 s one by one; in parallel ~0.6 s
+    assert elapsed < 2.5, elapsed
+    assert {check(conn, pid) for pid in range(200, 208)} == {"found"}

@@ -41,6 +41,14 @@ No migration is needed; the worker uses the existing tables as they are.
 JSONB doesn't keep key order, so `size_order` holds the chart's size order.
 The `unit` column is `inch`, `cm`, `mm`, or `unknown` when the page doesn't say.
 
+## Two phases: text charts first, image charts later
+
+1. **Text first:** run with `OCR_ENABLED=false`. Tables, Kiwi, size-chart app tables and Shopify
+   descriptions are saved; products whose only chart is an image are recorded as `pending_ocr`
+   (no Gemini calls). Image products without sizes are `not_found` (OCR could never verify them).
+2. **Images later:** set `OCR_ENABLED=true` and make the waiting products due again:
+   `DELETE FROM product_size_chart_checks WHERE result = 'pending_ocr';`
+
 ## Politeness
 
 - Each store's `robots.txt` is read (cached 6 hours) and disallowed URLs are not fetched.
@@ -129,6 +137,7 @@ CAPTCHAs and bot protection are recorded as `blocked`, never bypassed.
 | `BROWSER_RESTART_EVERY` | `50` | restart Chromium after N pages |
 | `MAX_CHART_ROWS` | `100` | larger "charts" are rejected |
 | `MAX_HTML_BYTES` | `8000000` | max page download |
+| `CONCURRENCY` | `8` | products processed at the same time per worker (pacing per store is shared by all threads) |
 | `PER_HOST_DELAY_MS` | `1000` | minimum gap between requests to the same store (a larger robots.txt `Crawl-delay` wins) |
 | `RESPECT_ROBOTS_TXT` | `true` | skip store URLs that the store's robots.txt disallows (recorded as `blocked`) |
 | `GEMINI_API_KEY` | empty | enables OCR of size-chart images; keep it secret (runtime only) |
