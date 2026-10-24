@@ -159,6 +159,8 @@ def http(monkeypatch):
                                   headers={"content-type": "application/json"})
         if request.url.host == "private.example.com" and request.url.path == "/robots.txt":
             return httpx.Response(200, text=ROBOTS_DISALLOW)
+        if request.url.host == "throttled.example.com" and request.url.path != "/robots.txt":
+            return httpx.Response(429, text="Too Many Requests", headers={"retry-after": "1"})
         status, body = PAGES.get(request.url.path, (404, "not found"))
         return httpx.Response(status, text=body, headers={"content-type": "text/html"})
 
@@ -168,6 +170,8 @@ def http(monkeypatch):
     monkeypatch.setattr(worker.SETTINGS, "batch_size", 20)
     monkeypatch.setattr(worker.SETTINGS, "gemini_api_key", "")
     monkeypatch.setattr(worker.SETTINGS, "per_host_delay_ms", 0)
+    monkeypatch.setattr(worker.SETTINGS, "max_requests_per_second", 10_000)
+    worker._limiter = None
     worker._robots.clear()
     worker._last_request.clear()
     ocr.clear_cache()
@@ -546,3 +550,16 @@ def test_batch_takes_one_product_per_store(conn, http):
     batch = worker.claim_products(8)
     stores = [p["product_url"].split("/")[2] for p in batch]
     assert len(stores) == len(set(stores)) == 6      # 5 small stores + 1 from the big store
+
+
+def test_http_429_is_rate_limited_and_retried_within_the_hour(conn, http):
+    add_product(conn, 400, "https://throttled.example.com/products/kurta")
+    worker.process_once()
+    assert check(conn, 400) == "rate_limited"
+    assert worker.get_limiter().rate < 10_000            # limiter slowed down
+    # Not picked again right away ...
+    assert worker.claim_products(10) == []
+    # ... but due again after an hour (not 24 h like "blocked").
+    conn.execute("UPDATE product_size_chart_checks SET checked_at = NOW() - interval '61 minutes' "
+                 "WHERE product_id = 400")
+    assert [p["product_id"] for p in worker.claim_products(10)] == [400]

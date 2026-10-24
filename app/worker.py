@@ -108,6 +108,11 @@ class Settings:
     # stores and per-store pacing is shared by all threads, so stores see the
     # same request rate; a slow store just no longer holds up the others.
     concurrency: int = field(default_factory=lambda: max(1, _env_int("CONCURRENCY", 8)))
+    # Store requests per second for this whole worker (all threads). Shopify
+    # rate-limits by client IP across all its stores, so per-store pacing alone
+    # is not enough; the limiter halves its rate on HTTP 429 and creeps back up.
+    max_requests_per_second: float = field(
+        default_factory=lambda: float(os.getenv("MAX_REQUESTS_PER_SECOND", "3")))
     browser_enabled: bool = field(default_factory=lambda: _env_bool("BROWSER_ENABLED", True))
     browser_restart_every: int = field(default_factory=lambda: _env_int("BROWSER_RESTART_EVERY", 50))
     # Size-chart images in the product description are read with Gemini when a key is set.
@@ -235,6 +240,21 @@ class FetchResult:
     html: str = ""
     error: str | None = None
     truncated: bool = False
+    retry_after: float | None = None
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    """Retry-After in seconds (number or HTTP date)."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        from email.utils import parsedate_to_datetime
+        return max(0.0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        return None
 
 
 _TEXT_CONTENT_TYPES = ("html", "json", "javascript", "text/plain", "xml")
@@ -263,7 +283,7 @@ def robots_for(client: httpx.Client, url: str) -> RobotFileParser | None:
     if cached and time.monotonic() - cached[0] < ROBOTS_TTL_SECONDS:
         return cached[1]
     parser: RobotFileParser | None = None
-    fetched = fetch_http(client, origin + "/robots.txt")
+    fetched = limited_fetch(client, origin + "/robots.txt")
     if not fetched.error and fetched.status == 200 and fetched.html:
         parser = RobotFileParser()
         parser.parse(fetched.html.splitlines())
@@ -295,8 +315,78 @@ def wait_for_host(url: str, crawl_delay: float | None = None) -> None:
         _stop.wait(min(slot - now, 60))
 
 
+class AdaptiveRateLimiter:
+    """
+    Requests per second across all store requests of this worker (all
+    threads). On HTTP 429 the rate is halved and everything pauses for the
+    server's Retry-After (or 30 s); after a run of successful requests the
+    rate creeps back up towards the configured maximum.
+    """
+
+    MIN_RATE = 0.2
+    OK_STREAK_TO_SPEED_UP = 50
+    SPEED_UP_STEP = 0.25
+    DEFAULT_PAUSE = 30.0
+    MAX_PAUSE = 600.0
+
+    def __init__(self, max_rate: float) -> None:
+        self.max_rate = max(self.MIN_RATE, max_rate)
+        self.rate = self.max_rate
+        self._next_slot = 0.0
+        self._paused_until = 0.0
+        self._last_slowdown = 0.0
+        self._ok_streak = 0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot, self._paused_until)
+            self._next_slot = slot + 1.0 / self.rate
+        if slot > now:
+            _stop.wait(min(slot - now, self.MAX_PAUSE))
+
+    def record(self, status: int | None, retry_after: float | None = None) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if status == 429:
+                self._ok_streak = 0
+                pause = min(retry_after if retry_after else self.DEFAULT_PAUSE, self.MAX_PAUSE)
+                self._paused_until = max(self._paused_until, now + pause)
+                # Many threads see the same 429 burst: slow down once per burst.
+                if now - self._last_slowdown > 5:
+                    self.rate = max(self.MIN_RATE, self.rate / 2)
+                    self._last_slowdown = now
+                    log_event("rate_limited", level=logging.WARNING,
+                              new_rate=round(self.rate, 2), pause_s=round(pause))
+            elif status is not None and status < 400:
+                self._ok_streak += 1
+                if self._ok_streak >= self.OK_STREAK_TO_SPEED_UP and self.rate < self.max_rate:
+                    self.rate = min(self.max_rate, self.rate + self.SPEED_UP_STEP)
+                    self._ok_streak = 0
+
+
+_limiter: AdaptiveRateLimiter | None = None
+
+
+def get_limiter() -> AdaptiveRateLimiter:
+    global _limiter
+    if _limiter is None:
+        _limiter = AdaptiveRateLimiter(SETTINGS.max_requests_per_second)
+    return _limiter
+
+
+def limited_fetch(client: httpx.Client, url: str) -> FetchResult:
+    """A store request through the worker-wide rate limiter."""
+    limiter = get_limiter()
+    limiter.acquire()
+    result = fetch_http(client, url)
+    limiter.record(result.status, result.retry_after)
+    return result
+
+
 def fetch_store_page(client: httpx.Client, url: str) -> FetchResult:
-    """Fetch a page of the store itself: robots.txt is checked and requests are paced."""
+    """Fetch a page of the store itself: robots.txt, per-store pacing and the global rate limit."""
     crawl_delay = None
     if SETTINGS.respect_robots:
         rules = robots_for(client, url)
@@ -305,7 +395,7 @@ def fetch_store_page(client: httpx.Client, url: str) -> FetchResult:
                 return FetchResult(url, url, error="robots.txt disallows this URL")
             crawl_delay = rules.crawl_delay("*")
     wait_for_host(url, crawl_delay)
-    return fetch_http(client, url)
+    return limited_fetch(client, url)
 
 
 def fetch_http(client: httpx.Client, url: str) -> FetchResult:
@@ -325,7 +415,8 @@ def fetch_http(client: httpx.Client, url: str) -> FetchResult:
                     break
                 chunks.append(chunk)
             html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
-            return FetchResult(url, final_url, response.status_code, html, truncated=truncated)
+            return FetchResult(url, final_url, response.status_code, html, truncated=truncated,
+                               retry_after=parse_retry_after(response.headers.get("retry-after")))
     except httpx.TooManyRedirects:
         return FetchResult(url, url, error="too_many_redirects")
     except httpx.HTTPError as exc:
@@ -479,6 +570,8 @@ def extract_shopify(url: str, shopify_product_id: str | None, client: httpx.Clie
     if not js_url or not shopify_product_id:
         return None
     fetched = fetch_store_page(client, js_url)
+    if fetched.status == 429:
+        return PageResult(status="rate_limited", error="http_429 (product JSON)")
     if fetched.error or fetched.status != 200:
         return None
     try:
@@ -546,11 +639,16 @@ def extract_product(
             return Outcome("found", url, chart=shopify.chart, http_status=200)
         if shopify.status == "product_mismatch":
             return Outcome("not_found", url, error=f"product_mismatch: {shopify.error}", http_status=200)
+        if shopify.status == "rate_limited":
+            return Outcome("rate_limited", url, error=shopify.error, http_status=429)
         images.extend(shopify.images)  # images in the product's own description first
 
     fetched = fetch_store_page(client, url)
     if fetched.error == "robots.txt disallows this URL":
         return Outcome("blocked", url, error=fetched.error)
+    if fetched.status == 429:
+        # Rate limited (Shopify limits per IP across all stores): retry soon, not "blocked".
+        return Outcome("rate_limited", url, error="http_429", http_status=429)
     store_chart: Outcome | None = None
     if fetched.error:
         errors.append(f"http: {fetched.error}")
@@ -643,6 +741,7 @@ OUTCOME_TO_RESULT = {
     "image_chart": "pending_ocr",
     "generic_chart": "generic_chart",
     "ocr_review": "ocr_review",
+    "rate_limited": "rate_limited",
     "blocked": "blocked",
     "failed": "failed",
 }
@@ -658,6 +757,7 @@ RECHECK_AFTER_SECONDS = {
     "pending_ocr": 30 * 24 * 3600,
     "generic_chart": 30 * 24 * 3600,
     "ocr_review": 30 * 24 * 3600,
+    "rate_limited": 3600,
 }
 MAX_ERROR_CHARS = 300
 
@@ -690,6 +790,7 @@ _CLAIM_PRODUCTS = """
                   WHEN 'pending_ocr' THEN %(pending_ocr)s * INTERVAL '1 second'
                   WHEN 'generic_chart' THEN %(generic_chart)s * INTERVAL '1 second'
                   WHEN 'ocr_review'  THEN %(ocr_review)s * INTERVAL '1 second'
+                  WHEN 'rate_limited' THEN %(rate_limited)s * INTERVAL '1 second'
               END
           )
         ORDER BY p.store_id, k.checked_at ASC NULLS FIRST, (p.id * 2654435761) %% 4294967291
@@ -1034,7 +1135,7 @@ def run_worker() -> None:
         return
 
     log_event("worker_started", worker=SETTINGS.worker_id, batch=SETTINGS.batch_size,
-              concurrency=SETTINGS.concurrency,
+              concurrency=SETTINGS.concurrency, max_rps=SETTINGS.max_requests_per_second,
               browser=SETTINGS.browser_enabled,
               ocr=f"gemini:{SETTINGS.gemini_model}" if ocr_enabled() else "off")
     try:

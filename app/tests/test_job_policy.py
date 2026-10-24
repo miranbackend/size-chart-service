@@ -57,3 +57,36 @@ def test_requests_to_one_store_are_paced(monkeypatch):
     assert time.monotonic() - start >= 0.19
     worker.wait_for_host("https://store-a.example.com/products/3", crawl_delay=0.4)
     assert time.monotonic() - start >= 0.58                           # robots Crawl-delay wins
+
+
+
+def test_rate_limiter_halves_pauses_and_recovers(monkeypatch):
+    import time
+    import worker
+    limiter = worker.AdaptiveRateLimiter(4.0)
+    limiter.record(429, retry_after=0.3)
+    assert limiter.rate == 2.0
+    limiter.record(429, retry_after=0.3)        # same burst: not halved again
+    assert limiter.rate == 2.0
+    start = time.monotonic()
+    limiter.acquire()                           # waits out the Retry-After pause
+    assert time.monotonic() - start >= 0.25
+    for _ in range(worker.AdaptiveRateLimiter.OK_STREAK_TO_SPEED_UP):
+        limiter.record(200)
+    assert limiter.rate == 2.25                 # creeps back up
+
+
+def test_rate_limiter_spaces_requests():
+    import time
+    import worker
+    limiter = worker.AdaptiveRateLimiter(10.0)  # 10 requests / second
+    start = time.monotonic()
+    for _ in range(6):
+        limiter.acquire()
+    assert time.monotonic() - start >= 0.45
+
+
+@pytest.mark.parametrize("value,seconds", [("30", 30.0), (None, None), ("", None), ("soon", None)])
+def test_parse_retry_after(value, seconds):
+    from worker import parse_retry_after
+    assert parse_retry_after(value) == seconds

@@ -54,6 +54,9 @@ The `unit` column is `inch`, `cm`, `mm`, or `unknown` when the page doesn't say.
 - Each store's `robots.txt` is read (cached 6 hours) and disallowed URLs are not fetched.
 - Requests to one store are spaced by `PER_HOST_DELAY_MS` (or its `Crawl-delay`).
 - Batches are spread across stores, so one worker never works through a single store back to back.
+- A worker-wide limit (`MAX_REQUESTS_PER_SECOND`) covers all its threads. Shopify rate-limits by
+  server IP across all its stores, so on HTTP 429 the worker halves its rate, pauses for
+  `Retry-After` (or 30 s) and records the product as `rate_limited` (retried after 1 hour).
 - CAPTCHAs / bot protection are recorded as `blocked` and never bypassed.
 
 ## How products are picked
@@ -71,6 +74,7 @@ same product. Unchecked products come first.
 | `ocr_review` | the two Gemini reads of the image disagreed (or it held several charts): not saved | 30 days |
 | `blocked` | CAPTCHA / anti-bot / HTTP 403 / 429 | 24 hours |
 | `failed` | network or unexpected error | 6 hours |
+| `rate_limited` | the store (Shopify, per server IP) answered HTTP 429 | 1 hour |
 | `processing` | being worked on now; older than 30 min means a worker died | 30 minutes |
 
 Error details are written to the worker log (`product_done ... error=...`),
@@ -137,6 +141,7 @@ CAPTCHAs and bot protection are recorded as `blocked`, never bypassed.
 | `BROWSER_RESTART_EVERY` | `50` | restart Chromium after N pages |
 | `MAX_CHART_ROWS` | `100` | larger "charts" are rejected |
 | `MAX_HTML_BYTES` | `8000000` | max page download |
+| `MAX_REQUESTS_PER_SECOND` | `3` | store requests per second for the whole worker; halves on HTTP 429 and creeps back up. Shopify limits per server IP across all its stores, so with N workers on one server the total is N x this |
 | `CONCURRENCY` | `8` | products processed at the same time per worker (pacing per store is shared by all threads) |
 | `PER_HOST_DELAY_MS` | `1000` | minimum gap between requests to the same store (a larger robots.txt `Crawl-delay` wins) |
 | `RESPECT_ROBOTS_TXT` | `true` | skip store URLs that the store's robots.txt disallows (recorded as `blocked`) |
